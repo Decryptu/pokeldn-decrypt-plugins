@@ -82,7 +82,7 @@ class Battle:
         self.tera = tera            # the boss's Tera type name
         self.rounds = 0
         self.hp = {i: b.hp for i, b in battlers.items()}
-        self.full = dict(self.hp)
+        self.full = {i: b.stats[0] for i, b in battlers.items()}
         self.triggers = frozenset()                     # boss HP shares its profile acts at
         self.stages = {i: [0] * 8 for i in battlers}     # stat stages by stat index (1 Atk ... 5 Spe)
 
@@ -101,18 +101,35 @@ class Battle:
             return 2.0 if move_type in self.types[BOSS] else 1.5
         return 1.5 if move_type in self.types[actor] else 1.0
 
+    def tera_move(self, actor, move):
+        """The boss is Terastallized: its moves of its Tera type (0x8b's eighth argument)."""
+        return actor == BOSS and move["category"] != "Status" and move["type"] == self.tera
+
+    def power(self, actor, move):
+        """Gen 9: a Tera-type move under 60 base power of a Terastallized user hits at 60."""
+        if self.tera_move(actor, move) and move["basePower"] < 60 and move.get("priority", 0) <= 0 \
+                and "multihit" not in move:
+            return 60
+        return move["basePower"]
+
     def damage(self, actor, target, move, roll, crit):
         a, d = self.b[actor], self.b[target]
         physical = move["category"] == "Physical"
         att = staged(a.stats[1], self.stages[actor][1]) if physical else staged(a.stats[4], self.stages[actor][3])
         dfn = staged(d.stats[2], self.stages[target][2]) if physical else staged(d.stats[5], self.stages[target][4])
-        base = (2 * a.level // 5 + 2) * move["basePower"] * att // dfn // 50 + 2
+        base = (2 * a.level // 5 + 2) * self.power(actor, move) * att // dfn // 50 + 2
         if crit:
             base = modify(base, 1.5)
         x = base * (100 - roll) // 100
         x = modify(x, self.stab(actor, move["type"]))
         e = self.effectiveness(move["type"], target)
         return int(x * e) if e >= 1 else int(x * e)
+
+
+def message(battler, text, *params):
+    """Command 0xcb: battle message `text` about `battler`, its parameters ended by END."""
+    args = (battler, text, *params, END)
+    return queue.encode(0xCB, args + (0,) * (10 - len(args)))
 
 
 def plain(move):
@@ -127,8 +144,6 @@ def plain(move):
         raise Unsupported(f"target {move['target']} or priority")
     if move.get("critRatio", 1) not in CRIT_DRAW:
         raise Unsupported("crit stage")
-    if len(secondaries(move)) > 1:
-        raise Unsupported("a move with secondaries")       # Ice Fang draws one chance, not two
     for sec in secondaries(move):
         if set(sec) - {"chance", "status", "volatileStatus"} or "chance" not in sec:
             raise Unsupported("secondary")                  # a stat drop can draw chance(0) instead
@@ -153,6 +168,8 @@ def use(battle, actor, number, position, order):
     if crit:
         raise Unsupported("a critical hit")
     for sec in secondaries(move):
+        if target == BOSS and sec.get("volatileStatus") == "flinch":
+            continue                                        # the boss cannot flinch: no draw
         if r.chance(sec["chance"]):
             raise Unsupported("a secondary effect")
     e = battle.effectiveness(move["type"], target)
@@ -185,7 +202,7 @@ def use(battle, actor, number, position, order):
     q += queue.encode(0x7E, (0, *hit))
     q += queue.encode(0x7E, (1, 0, 0, 0, 0, 0))
     q += queue.encode(0x7E, (2, *e5))
-    q += queue.encode(0x8B, (apos, tpos, number, mtype, 0, 0, 1, 0, 0, 0))
+    q += queue.encode(0x8B, (apos, tpos, number, mtype, 0, 0, 1, int(battle.tera_move(actor, move)), 0, 0))
     q += queue.encode(0x37, (target, 2, dmg)) + queue.encode(0x37, (target, 5, 1))
     q += queue.encode(0x02, (target, actor, dmg, 3))
     q += queue.encode(0xD0, bytes([target, code]))
@@ -198,6 +215,13 @@ def use(battle, actor, number, position, order):
     if code > 7:
         q += queue.encode(0x20, (actor, 24))
     q += queue.encode(0x42, (target, actor, apos, mtype, cat, number, dmg))
+    if "drain" in move:
+        n, d = move["drain"]
+        heal = min(int(dmg * n / d + 0.5), battle.full[actor] - battle.hp[actor])
+        if heal > 0:
+            battle.hp[actor] += heal
+            q += queue.encode(0xA7, (target, 51)) + queue.encode(0x03, (actor, heal))
+            q += queue.encode(0x9A, (actor, heal)) + message(actor, 290, target)
     q += queue.encode(0xD1, bytes([1, 0]))
     q += queue.encode(0x2E, (2, actor - 1))
     if target == BOSS:
