@@ -20,12 +20,15 @@ game's battle server kept in a pokeldn checkout's `scratchpad/battle/oracle` (fo
 
     POKELDN_ROOT=~/Documents/GitHub/pokeldn ~/Documents/GitHub/pokeldn/.venv/bin/python -m pytest tests -q
 
+`tools/corpus_check.py start 'CORPUS/*.json'` compares the plugin with a corpus of oracle battles
+(pokeldn's `scratchpad/battle/oracle/corpus.py` writes one): equal, refused with the reason, or different.
+
 ## Milestones
 
 | step | what | state |
 |---|---|---|
 | 1 | random numbers, the command queue codec, message headers | done: draws equal the oracle's on 300 seeds; 20 recorded queues round-trip |
-| 2 | the battle start and one plain damaging move on the boss, byte for byte with a recorded round | open |
+| 2 | the battle start and one plain damaging move on the boss, byte for byte with a recorded round | start body: 144 of 233 oracle battles equal, the rest refused, none different; rounds open |
 | 3 | damage, accuracy, critical hits, the type chart, Tera | open |
 | 4 | status moves, stat stages, the common abilities and items | open |
 | 5 | fainting, the timer, the boss's actions and shield, the battle's end | open |
