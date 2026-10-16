@@ -60,6 +60,11 @@ def actions(command):
     return out
 
 
+def staged(stat, stage):
+    """A stat at a stage: times (2 + stage) / 2 raised, 2 / (2 - stage) lowered."""
+    return stat * (2 + stage) // 2 if stage >= 0 else stat * 2 // (2 - stage)
+
+
 def modify(value, factor):
     """Showdown's chained modifier: value times factor in 4096ths, rounded half down."""
     mod = int(factor * 4096)
@@ -76,6 +81,7 @@ class Battle:
         self.tera = tera            # the boss's Tera type name
         self.rounds = 0
         self.hp = {i: b.hp for i, b in battlers.items()}
+        self.stages = {i: [0] * 8 for i in battlers}     # stat stages by stat index (1 Atk ... 5 Spe)
 
     def defending(self, target):
         return [self.tera] if target == BOSS else self.types[target]
@@ -95,8 +101,8 @@ class Battle:
     def damage(self, actor, target, move, roll, crit):
         a, d = self.b[actor], self.b[target]
         physical = move["category"] == "Physical"
-        att = a.stats[1] if physical else a.stats[4]
-        dfn = d.stats[2] if physical else d.stats[5]
+        att = staged(a.stats[1], self.stages[actor][1]) if physical else staged(a.stats[4], self.stages[actor][3])
+        dfn = staged(d.stats[2], self.stages[target][2]) if physical else staged(d.stats[5], self.stages[target][4])
         base = (2 * a.level // 5 + 2) * move["basePower"] * att // dfn // 50 + 2
         if crit:
             base = modify(base, 1.5)
@@ -109,7 +115,7 @@ class Battle:
 def plain(move):
     if move is None or move["category"] == "Status" or not move.get("basePower"):
         raise Unsupported("not a damaging move")
-    for key in ("multihit", "drain", "recoil", "self", "volatileStatus", "status", "boosts"):
+    for key in ("multihit", "recoil", "self", "volatileStatus", "status", "boosts"):
         if key in move:
             raise Unsupported(f"a move with {key}")
     if set(move["callbacks"]) - IDLE_MOVE_CALLBACKS.get(move["name"], set()):
