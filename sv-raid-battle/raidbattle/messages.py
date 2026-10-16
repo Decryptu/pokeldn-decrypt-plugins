@@ -10,11 +10,13 @@ EVERY = 5
 
 def message(kind, step, round_, body=b"", destination=EVERY):
     head = bytearray(HEADER)
-    struct.pack_into("<IQQBB", head, 0, kind, step, round_, destination, EVERY)
+    struct.pack_into("<I", head, 0, kind)
+    struct.pack_into("<QQBB", head, 8, step, round_, destination, EVERY)
     return bytes(head) + bytes(body)
 
 
 def header(raw):
     """-> (type, step, round, destination) of a message."""
-    kind, step, round_, destination = struct.unpack_from("<IQQB", raw, 0)
+    kind, = struct.unpack_from("<I", raw, 0)
+    step, round_, destination = struct.unpack_from("<QQB", raw, 8)
     return kind, step, round_, destination
