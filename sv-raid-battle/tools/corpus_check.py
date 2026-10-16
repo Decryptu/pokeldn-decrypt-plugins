@@ -34,6 +34,7 @@ def check_round(d):
         raise Unsupported("no round")
     want = rounds_sent[0][0x20:]
     battle = battlers.battle(bytes.fromhex(d["bootstrap"]), [bytes.fromhex(p) for p in d["partners"]])
+    start.body(battle.b)                      # the server refuses what its start body cannot build
     got, _ = rounds.build(battle, command[0x19], command)
     if got == want:
         return "equal", ""
@@ -46,18 +47,42 @@ def check_round(d):
     return "different", f"command {i}: ours {a[i:i+2]} oracle {b[i:i+2]}"
 
 
+def check_rounds(d):
+    """Every round of the battle, built in order from the commands, against the oracle's: the verdict of
+    the first round that is not equal, and how many came before it."""
+    from raidbattle import rounds
+    events = [e for e in d["events"] if e[0] != "draw"]
+    commands = [bytes.fromhex(h) for t, io, s, h in events if io == "in" and h[:2] == "06"]
+    sent = [m[0x20:] for m in server_messages(d, 0x15)]
+    battle = battlers.battle(bytes.fromhex(d["bootstrap"]), [bytes.fromhex(p) for p in d["partners"]])
+    start.body(battle.b)
+    for n, (command, want) in enumerate(zip(commands, sent)):
+        try:
+            got, _ = rounds.build(battle, command[0x19], command)
+        except Unsupported as e:
+            if n == 0:
+                raise
+            return "partial", f"{n} of {len(sent)}; then {e}"
+        if got != want:
+            m = struct.unpack_from("<I", want, 0x238)[0]
+            a, b = queue.decode(got[0x23c:0x23c + struct.unpack_from("<I", got, 0x238)[0]]), queue.decode(want[0x23c:0x23c + m])
+            i = next((i for i in range(min(len(a), len(b))) if a[i] != b[i]), min(len(a), len(b)))
+            return "different", f"round {n} command {i}: ours {a[i:i+2]} oracle {b[i:i+2]}"
+    return "equal", f"{len(sent)} rounds"
+
+
 def main():
     what, pattern = sys.argv[1], sys.argv[2]
     tally, why = collections.Counter(), collections.Counter()
     for f in sorted(glob.glob(pattern)):
         d = json.load(open(f))
         try:
-            verdict, detail = (check_round if what == "round" else check_start)(d)
+            verdict, detail = {"round": check_round, "rounds": check_rounds, "start": check_start}[what](d)
         except Unsupported as e:
             verdict, detail = "refused", str(e)
             why[str(e).split("'s ")[-1] if what == "start" else str(e)] += 1
         tally[verdict] += 1
-        if verdict == "different":
+        if verdict in ("different", "partial") or what == "rounds" and verdict == "equal":
             print(os.path.basename(f), detail)
     print(dict(tally))
     for k, n in why.most_common(10):

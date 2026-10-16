@@ -18,6 +18,23 @@ BATTLER_AT = {v: k for k, v in POSITION.items()}
 BLOCK, ACTION, COUNTS, BODY = 0x70, 0x10, 0x230, 0x5060
 END = 0xFFFF0000
 CRIT_DRAW = {1: 24, 2: 8, 3: 2}
+_data = lambda name: json.load(open(os.path.join(os.path.dirname(__file__), "data", name)))
+ABILITIES, ITEMS = _data("abilities.json"), _data("items.json")
+# callbacks that cannot fire in a plain round: switching, statuses, boosts, weather, fainting
+INERT = {"onStart", "onEnd", "onSwitchIn", "onSwitchOut", "onAnySwitchIn", "onDeductPP", "onSetStatus",
+         "onAllySetStatus", "onTryAddVolatile", "onAllyTryAddVolatile", "onImmunity", "onTryBoost",
+         "onChangeBoost", "onAfterBoost", "onAfterEachBoost", "onTryEatItem", "onFoeTryEatItem", "onEatItem",
+         "onTakeItem", "onFoeTrapPokemon", "onFoeMaybeTrapPokemon", "onDragOut", "onModifyWeight",
+         "onWeather", "onWeatherChange", "onAnySetWeather", "onTerrainChange", "onAllyFaint",
+         "onSourceAfterFaint", "onFaint", "onUpdate", "condition"}
+# abilities and items whose callbacks did not fire in any plain first round of the oracle corpus
+IDLE_ABILITIES = frozenset((3, 29, 33, 34, 44, 47, 49, 53, 77, 81, 84, 87, 101, 124, 137, 141, 158, 232, 246, 298,
+                            304))
+IDLE_ITEMS = frozenset((234, 541))
+# move callbacks that cannot fire in a plain round (Facade: a status the round never sets)
+IDLE_MOVE_CALLBACKS = {"Facade": {"onBasePower"}}
+PRESSURE = 46               # a move aimed at it spends 2 PP: 0x05 (b, 0, 2)
+STALL = 100                 # moves last in its bracket; 0x51 (b, 0) in the speed pass
 EFFECTIVENESS = {0.25: 5, 0.5: 6, 1: 7, 2: 8, 4: 9}
 
 
@@ -92,21 +109,31 @@ class Battle:
 def plain(move):
     if move is None or move["category"] == "Status" or not move.get("basePower"):
         raise Unsupported("not a damaging move")
-    for key in ("multihit", "drain", "recoil", "self", "secondaries"):
+    for key in ("multihit", "drain", "recoil", "self", "volatileStatus", "status", "boosts"):
         if key in move:
             raise Unsupported(f"a move with {key}")
+    if set(move["callbacks"]) - IDLE_MOVE_CALLBACKS.get(move["name"], set()):
+        raise Unsupported(f"{move['name']}'s {move['callbacks'][0]}")
     if move["target"] != "normal" or move.get("priority", 0):
         raise Unsupported(f"target {move['target']} or priority")
     if move.get("critRatio", 1) not in CRIT_DRAW:
         raise Unsupported("crit stage")
-    sec = move.get("secondary")
-    if sec and set(sec) - {"chance", "status", "volatileStatus", "boosts"}:
-        raise Unsupported("secondary")
+    if len(secondaries(move)) > 1:
+        raise Unsupported("a move with secondaries")       # Ice Fang draws one chance, not two
+    for sec in secondaries(move):
+        if set(sec) - {"chance", "status", "volatileStatus"} or "chance" not in sec:
+            raise Unsupported("secondary")                  # a stat drop can draw chance(0) instead
     return move
+
+
+def secondaries(move):
+    return move.get("secondaries") or ([move["secondary"]] if move.get("secondary") else [])
 
 
 def use(battle, actor, number, position, order):
     """-> the queue for one move use, and the order list gets the actor."""
+    if number in UNSEEN_MOVES:
+        raise Unsupported(f"move {number} was never probed")
     move = plain(MOVES.get(number))
     target = BATTLER_AT[position]
     r = battle.rng
@@ -116,11 +143,11 @@ def use(battle, actor, number, position, order):
     roll = r.below(16)
     if crit:
         raise Unsupported("a critical hit")
-    sec = move.get("secondary")
-    if sec and r.chance(sec["chance"]):
-        raise Unsupported("a secondary effect")
+    for sec in secondaries(move):
+        if r.chance(sec["chance"]):
+            raise Unsupported("a secondary effect")
     e = battle.effectiveness(move["type"], target)
-    if e not in EFFECTIVENESS or e > 1:
+    if e not in EFFECTIVENESS:
         raise Unsupported(f"effectiveness {e}")
     code = EFFECTIVENESS[e]
     dmg = battle.damage(actor, target, move, roll, crit)
@@ -135,7 +162,7 @@ def use(battle, actor, number, position, order):
     hit[tpos] = 1
     q = b""
     if actor != BOSS:
-        q += queue.encode(0x05, (actor, 0, 1))
+        q += queue.encode(0x05, (actor, 0, 2 if battle.b[target].ability == PRESSURE else 1))
     q += queue.encode(0x07, (actor, 0))
     q += queue.encode(0xC9, (actor, 0, number, tpos, 0))
     q += queue.encode(0x7B, (number, battle.rounds, actor))
@@ -151,7 +178,11 @@ def use(battle, actor, number, position, order):
     if code == 7:
         q += queue.encode(0x8E, (1, 1, number))
     else:
-        q += queue.encode(0x8E, (1, 3, number)) + queue.encode(0xCA, (actor, 575, END) + (0,) * 7)
+        weak = code > 7
+        q += queue.encode(0x8E, (1, 2 if weak else 3, number))
+        q += queue.encode(0xCA, (actor, 574 if weak else 575, END) + (0,) * 7)
+    if code > 7:
+        q += queue.encode(0x20, (actor, 24))
     q += queue.encode(0x42, (target, actor, apos, mtype, cat, number, dmg))
     q += queue.encode(0xD1, bytes([1, 0]))
     q += queue.encode(0x2E, (2, actor - 1))
@@ -166,22 +197,43 @@ def use(battle, actor, number, position, order):
     return q
 
 
+def callbacks(b):
+    """The live callbacks of a battler's ability and held item, less those measured idle in plain rounds."""
+    live = set() if b.ability in IDLE_ABILITIES else set(ABILITIES.get(str(b.ability), ["unknown"])) - INERT
+    if b.ability == STALL:
+        live.discard("onFractionalPriority")
+    if b.item and b.item not in IDLE_ITEMS:
+        item = set(ITEMS.get(str(b.item), ["unknown"]))
+        live |= item - INERT | item & {"onUpdate"}       # a berry eats on its update
+    return live
+
+
 def build(battle, slot, command):
     """-> (the round body for `slot`'s command, whether it wins)."""
     acts = actions(command)
-    for actor, number, _ in acts:
-        if number in HANDLER_MOVES:
-            raise Unsupported(f"move {number} registers a handler")
+    involved = {a[0] for a in acts} | {BATTLER_AT[a[2]] for a in acts if a[2] in BATTLER_AT}
+    for b in battle.b.values():
+        live = callbacks(b)
+        if b.id not in involved:
+            live = {k for k in live if k == "onResidual" or k.startswith("onAny")}
+        if live:
+            raise Unsupported(f"battler {b.id}'s ability {b.ability} or item {b.item}: {sorted(live)[0]}")
     speed = lambda a: battle.b[a[0]].speed
     by_id = sorted(acts, key=lambda a: a[0])
-    ordered = sorted(acts, key=lambda a: -speed(a))
+    last = lambda a: battle.b[a[0]].ability == STALL
+    ordered = sorted(acts, key=lambda a: (last(a), -speed(a)))
     if len({speed(a) for a in acts}) != len(acts):
         raise Unsupported("a speed tie")
     q = queue.encode(0xB5, (0,))
-    q += b"".join(queue.encode(0x51, (a[0], 1)) for a in by_id)
-    q += b"".join(queue.encode(0x51, (a[0], 1)) for a in ordered)
+    for run, pass_ in ((by_id, 0), (ordered, 1)):
+        q += b"".join(queue.encode(0x51, (a[0], 0 if pass_ and last(a) else 1)) for a in run)
+        q += b"".join(handler(battle, a, 0) for a in run)
+    q += b"".join(handler(battle, a, 0) for a in ordered) * 2
     order = []
-    for actor, number, position in ordered:
+    for i, (actor, number, position) in enumerate(ordered):
+        if i:
+            q += b"".join(handler(battle, a, 0) for a in ordered)
+        q += handler(battle, (actor, number), 0x72000, last=False)
         q += use(battle, actor, number, position, order)
     q += queue.encode(0xB2, (0,))
     q += b"".join(queue.encode(0x37, (a, 7, 1)) for a in order)
@@ -196,6 +248,15 @@ def build(battle, slot, command):
     return body + bytes(BODY - len(body)), False
 
 
+def handler(battle, act, base, last=True):
+    """0x5a (b, M, base + speed) and, after a pass, 0x5b (b, M), for a move that registers a handler."""
+    actor, number = act[0], act[1]
+    if number not in HANDLER_MOVES:
+        return b""
+    q = queue.encode(0x5A, (actor, number, base + battle.b[actor].speed))
+    return q + queue.encode(0x5B, (actor, number)) if last else q
+
+
 def ROUND_END_ORDER(battle):
     """The battlers in speed order."""
     speeds = [battle.b[b].speed for b in battle.b]
@@ -204,4 +265,5 @@ def ROUND_END_ORDER(battle):
     return sorted(battle.b, key=lambda b: -battle.b[b].speed)
 
 
-HANDLER_MOVES = frozenset()
+_probe = _data("handler_moves.json")
+HANDLER_MOVES, UNSEEN_MOVES = frozenset(_probe["handler"]), frozenset(_probe["unseen"])
