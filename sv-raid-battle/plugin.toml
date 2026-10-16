@@ -5,3 +5,4 @@ version = "0.1.0"
 author = "Decryptu"
 homepage = "https://github.com/Decryptu/pokeldn-decrypt-plugins"
 api = "1.6"
+exclude = ["tests", "tools", "scripts"]
