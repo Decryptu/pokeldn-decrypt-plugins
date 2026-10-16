@@ -18,6 +18,7 @@ QUIET_ABILITIES = frozenset([1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 17, 18,
 class Battler:
     id: int
     species: int
+    form: int
     level: int
     ability: int
     item: int
@@ -37,6 +38,24 @@ def from_records(bootstrap, partners):
     out = {}
     for battler, slot in SLOT.items():
         f = gen9.read(gen9.decrypt(bytes(records[slot])))
-        out[battler] = Battler(battler, f["species"], f["level"], f["ability"], f["held_item"],
+        out[battler] = Battler(battler, f["species"], f["form"], f["level"], f["ability"], f["held_item"],
                                tuple(f["stats"]), f["current_hp"], tuple(f["moves"]))
     return out
+
+
+TYPE_NONE = 19
+
+
+def battle(bootstrap, partners):
+    """-> a rounds.Battle at the start: the battlers, the generator seeded with the RaidPoint's randSeed
+    (pokeldn docs/sv_raid.md, The battle's random numbers), each battler's types and the boss's Tera type."""
+    import struct
+    from pokeldn.sv import raid_encounter
+    from raidbattle import rng, rounds
+    b = from_records(bootstrap, partners)
+    seed = struct.unpack_from("<Q", bootstrap, 5 * PARTY_RECORD + 0x3D8)[0]
+    types = {i: [rounds.TYPES[t] for t in dict.fromkeys(raid_encounter.personal(x.species, x.form)[1])]
+             for i, x in b.items()}
+    boss = gen9.read(gen9.decrypt(bytes(bootstrap[4 * PARTY_RECORD:5 * PARTY_RECORD])))
+    tera = boss["tera_type_override"] if boss["tera_type_override"] != TYPE_NONE else boss["tera_type_original"]
+    return rounds.Battle(b, rng.Random(seed), types, rounds.TYPES[tera])
