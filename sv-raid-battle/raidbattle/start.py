@@ -5,6 +5,8 @@ from raidbattle.battlers import QUIET_ABILITIES
 from raidbattle.server import Unsupported
 
 PRESSURE, OWN_TEMPO, INNER_FOCUS, INTIMIDATE, DEFIANT, FRISK = 46, 20, 39, 22, 128, 119
+UNNERVE, ANTICIPATION = 127, 107
+MESSAGE_UNNERVE, MESSAGE_ANTICIPATION = 679, 145
 BOSS = 2
 ATK = 1
 # a target's answer to Intimidate: Own Tempo blocks it, Defiant raises Attack 2; these are refused
@@ -27,9 +29,31 @@ def send_out(b):
                      queue.encode(0x6B, (b.id,)), queue.encode(0x4E, (b.id,))])
 
 
-def ability_event(b, body):
-    """An ability's activation: 0x25 and 0xc7 open it, 0xc8 closes it."""
-    return queue.encode(0x25, (b.id,)) + queue.encode(0xC7, (b.id, 0)) + body + queue.encode(0xC8, (b.id,))
+def ability_event(b, body, shown=0):
+    """An ability's activation: 0x25 and 0xc7 open it, 0xc8 closes it; Unnerve shows its id in 0xc7."""
+    return queue.encode(0x25, (b.id,)) + queue.encode(0xC7, (b.id, shown)) + body + queue.encode(0xC8, (b.id,))
+
+
+def unnerve(b):
+    """Unnerve runs before every speed-ordered event; message 679 names the foes' side (1 the boss's)."""
+    args = (b.id, MESSAGE_UNNERVE, int(b.id != BOSS), END)
+    return ability_event(b, queue.encode(0xCA, args + (0,) * (10 - len(args))), UNNERVE)
+
+
+def anticipation(b, battlers, battle):
+    """Anticipation shudders (message 145) when a foe knows a damaging move super effective on it, or
+    a one-hit KO move (Showdown abilities.ts, anticipation)."""
+    from raidbattle import rounds
+    if battle is None:
+        raise Unsupported("Anticipation needs the battlers' types")
+    for f in foes(b, battlers):
+        for m in f.moves:
+            move = rounds.MOVES.get(m)
+            if not m or move is None:
+                continue
+            if "ohko" in move["callbacks"] or (move["category"] != "Status" and battle.effectiveness(move["type"], b.id) > 1):
+                return ability_event(b, message(b.id, MESSAGE_ANTICIPATION, b.id))
+    return b""
 
 
 def foes(b, battlers):
@@ -67,9 +91,13 @@ def frisk(b, battlers):
     return ability_event(b, out)
 
 
-def switch_in(b, battlers, stages):
+def switch_in(b, battlers, stages, battle=None):
     out = b""
-    if b.ability == FRISK:
+    if b.ability == ANTICIPATION:
+        out += anticipation(b, battlers, battle)
+    elif b.ability == UNNERVE:
+        pass
+    elif b.ability == FRISK:
         out += frisk(b, battlers)
     elif b.ability == INTIMIDATE:
         out += ability_event(b, intimidate(b, battlers, stages))
@@ -84,14 +112,19 @@ def switch_in(b, battlers, stages):
     return out
 
 
-def body(battlers, stages=None):
-    """-> the 0x11 body for {id: Battler}; `stages` ({id: [0] * 8}) gets the stat stages it sets."""
+def body(battlers, stages=None, battle=None):
+    """-> the 0x11 body for {id: Battler}; `stages` ({id: [0] * 8}) gets the stat stages it sets;
+    `battle` (rounds.Battle) gives the types Anticipation reads."""
     stages = stages if stages is not None else {i: [0] * 8 for i in battlers}
     ordered = sorted(battlers.values(), key=lambda b: -b.speed)
-    acting = [b for b in ordered if switch_in(b, battlers, {i: [0] * 8 for i in battlers})]
+    acting = [b for b in ordered if switch_in(b, battlers, {i: [0] * 8 for i in battlers}, battle)]
     speeds = [b.speed for b in acting]
     if len(set(speeds)) != len(speeds):
         raise Unsupported("a speed tie among switch-in events")
     out = b"".join(send_out(battlers[i]) for i in sorted(battlers))
-    out += b"".join(switch_in(b, battlers, stages) for b in acting)
+    unnerving = [b for b in ordered if b.ability == UNNERVE]
+    if len(unnerving) > 1:
+        raise Unsupported("more than one Unnerve")
+    out += b"".join(unnerve(b) for b in unnerving)
+    out += b"".join(switch_in(b, battlers, stages, battle) for b in acting)
     return out + queue.encode(0x2B, (0,))

@@ -16,7 +16,12 @@ def server_messages(d, kind):
 
 def check_start(d):
     want = server_messages(d, 0x11)[0][0x20:]
-    got = start.body(battlers.from_records(bytes.fromhex(d["bootstrap"]), [bytes.fromhex(p) for p in d["partners"]]))
+    records = bytes.fromhex(d["bootstrap"]), [bytes.fromhex(p) for p in d["partners"]]
+    try:
+        battle = battlers.battle(*records)
+    except Unsupported:                       # a species with no personal entry: no types
+        battle = None
+    got = start.body(battle.b if battle else battlers.from_records(*records), None, battle)
     if got == want:
         return "equal", ""
     a, b = queue.decode(got), queue.decode(want)
@@ -34,7 +39,7 @@ def check_round(d):
         raise Unsupported("no round")
     want = rounds_sent[0][0x20:]
     battle = battlers.battle(bytes.fromhex(d["bootstrap"]), [bytes.fromhex(p) for p in d["partners"]])
-    start.body(battle.b)                      # the server refuses what its start body cannot build
+    start.body(battle.b, None, battle)                      # the server refuses what its start body cannot build
     got, _ = rounds.build(battle, command[0x19], command)
     if got == want:
         return "equal", ""
@@ -55,7 +60,7 @@ def check_rounds(d):
     commands = [bytes.fromhex(h) for t, io, s, h in events if io == "in" and h[:2] == "06"]
     sent = [m[0x20:] for m in server_messages(d, 0x15)]
     battle = battlers.battle(bytes.fromhex(d["bootstrap"]), [bytes.fromhex(p) for p in d["partners"]])
-    start.body(battle.b)
+    start.body(battle.b, None, battle)
     for n, (command, want) in enumerate(zip(commands, sent)):
         try:
             got, _ = rounds.build(battle, command[0x19], command)

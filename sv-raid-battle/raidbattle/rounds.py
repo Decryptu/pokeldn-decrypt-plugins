@@ -28,11 +28,12 @@ INERT = {"onStart", "onEnd", "onSwitchIn", "onSwitchOut", "onAnySwitchIn", "onDe
          "onWeather", "onWeatherChange", "onAnySetWeather", "onTerrainChange", "onAllyFaint",
          "onSourceAfterFaint", "onFaint", "onUpdate", "condition"}
 # abilities and items whose callbacks did not fire in any plain first round of the oracle corpus
-IDLE_ABILITIES = frozenset((3, 29, 33, 34, 44, 47, 49, 53, 77, 81, 84, 87, 101, 124, 137, 141, 158, 232, 246, 298,
+IDLE_ABILITIES = frozenset((3, 29, 33, 34, 44, 47, 49, 53, 77, 81, 84, 87, 124, 137, 141, 158, 232, 246, 298,
                             304))
 IDLE_ITEMS = frozenset((234, 541))
 # move callbacks that cannot fire in a plain round (Facade: a status the round never sets)
 IDLE_MOVE_CALLBACKS = {"Facade": {"onBasePower"}}
+KNOCKOUTS = False            # set by the spec tools while knockouts are built
 PRESSURE = 46               # a move aimed at it spends 2 PP: 0x05 (b, 0, 2)
 STALL = 100                 # moves last in its bracket; 0x51 (b, 0) in the speed pass
 EFFECTIVENESS = {0.25: 5, 0.5: 6, 1: 7, 2: 8, 4: 9}
@@ -81,6 +82,8 @@ class Battle:
         self.tera = tera            # the boss's Tera type name
         self.rounds = 0
         self.hp = {i: b.hp for i, b in battlers.items()}
+        self.full = dict(self.hp)
+        self.triggers = frozenset()                     # boss HP shares its profile acts at
         self.stages = {i: [0] * 8 for i in battlers}     # stat stages by stat index (1 Atk ... 5 Spe)
 
     def defending(self, target):
@@ -157,8 +160,13 @@ def use(battle, actor, number, position, order):
         raise Unsupported(f"effectiveness {e}")
     code = EFFECTIVENESS[e]
     dmg = battle.damage(actor, target, move, roll, crit)
-    if dmg >= battle.hp[target]:
+    if dmg >= battle.hp[target] and not KNOCKOUTS:
         raise Unsupported("a knockout")
+    dmg = min(dmg, battle.hp[target])
+    if target == BOSS:
+        share = lambda hp: hp * 100 / battle.full[BOSS]
+        if any(share(battle.hp[BOSS] - dmg) <= t < share(battle.hp[BOSS]) for t in battle.triggers):
+            raise Unsupported("a boss HP trigger")
     battle.hp[target] -= dmg
     mtype, cat = TYPES.index(move["type"]), 1 if move["category"] == "Physical" else 2
     apos, tpos = POSITION[actor], POSITION[target]

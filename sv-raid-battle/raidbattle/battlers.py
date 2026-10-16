@@ -54,11 +54,29 @@ def battle(bootstrap, partners):
     from raidbattle import rng, rounds
     b = from_records(bootstrap, partners)
     seed = struct.unpack_from("<Q", bootstrap, 5 * PARTY_RECORD + 0x3D8)[0]
-    types = {i: [rounds.TYPES[t] for t in dict.fromkeys(raid_encounter.personal(x.species, x.form)[1])]
-             for i, x in b.items()}
+    try:
+        types = {i: [rounds.TYPES[t] for t in dict.fromkeys(raid_encounter.personal(x.species, x.form)[1])]
+                 for i, x in b.items()}
+    except KeyError as e:
+        from raidbattle.server import Unsupported
+        raise Unsupported(f"species {e} has no personal entry") from None
     boss = gen9.read(gen9.decrypt(bytes(bootstrap[4 * PARTY_RECORD:5 * PARTY_RECORD])))
     tera = boss["tera_type_override"] if boss["tera_type_override"] != TYPE_NONE else boss["tera_type_original"]
     from raidbattle import start
     battle = rounds.Battle(b, rng.Random(seed), types, rounds.TYPES[tera])
-    start.body(b, battle.stages)
+    profile = struct.unpack_from("<37I", bootstrap, 5 * PARTY_RECORD + 0x4C)
+    battle.hp[rounds.BOSS] = battle.full[rounds.BOSS] = b[rounds.BOSS].stats[0] * profile[0] // 100
+    battle.triggers = boss_triggers(profile)
+    start.body(b, battle.stages, battle)
     return battle
+
+
+def boss_triggers(profile):
+    """The boss's HP shares (percent) at which its action profile acts (pokeldn docs/sv_raid.md, The
+    RaidPoint): the shield, each extra action with HP timing (2), the double action."""
+    out = {profile[1], profile[34]}
+    for i in range(6):
+        action, timing, value, _move = profile[10 + 4 * i:14 + 4 * i]
+        if action and timing == 2:
+            out.add(value)
+    return frozenset(out - {0})
