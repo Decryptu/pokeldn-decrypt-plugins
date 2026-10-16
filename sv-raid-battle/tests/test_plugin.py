@@ -1,4 +1,4 @@
-"""The plugin loads into pokeldn and refuses a battle it cannot reproduce."""
+"""The plugin loads into pokeldn and serves a battle it builds."""
 import json
 import os
 import sys
@@ -20,10 +20,10 @@ def test_pokeldn_finds_the_battle_server(monkeypatch):
     try:
         server = plugins.battle_server("sv", "clean")
         assert server is not None and server.plugin == "sv-raid-battle"
-        from raidbattle.server import Unsupported
-        case = json.loads((Path(__file__).parent / "data" / "starts.json").read_text())[0]
-        with pytest.raises(Unsupported):
-            raid_battle.RaidBattle(server.factory, bytes.fromhex(case["bootstrap"]),
-                                   partners=[bytes.fromhex(p) for p in case["partners"]])
+        case = json.loads((Path(__file__).parent / "data" / "battles.json").read_text())[0]
+        battle = raid_battle.RaidBattle(server.factory, bytes.fromhex(case["bootstrap"]),
+                                        partners=[bytes.fromhex(p) for p in case["partners"]])
+        battle.start(0.0)
+        assert battle.poll(0.1)
     finally:
         plugins._reset()

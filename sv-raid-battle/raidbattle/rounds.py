@@ -167,19 +167,22 @@ def use(battle, actor, number, position, order):
     roll = r.below(16)
     if crit:
         raise Unsupported("a critical hit")
-    for sec in secondaries(move):
-        if target == BOSS and sec.get("volatileStatus") == "flinch":
-            continue                                        # the boss cannot flinch: no draw
-        if r.chance(sec["chance"]):
-            raise Unsupported("a secondary effect")
     e = battle.effectiveness(move["type"], target)
     if e not in EFFECTIVENESS:
         raise Unsupported(f"effectiveness {e}")
     code = EFFECTIVENESS[e]
     dmg = battle.damage(actor, target, move, roll, crit)
-    if dmg >= battle.hp[target] and not KNOCKOUTS:
+    if dmg >= battle.hp[target] and target != BOSS and not KNOCKOUTS:
         raise Unsupported("a knockout")
     dmg = min(dmg, battle.hp[target])
+    knockout = target == BOSS and dmg == battle.hp[target]
+    if knockout:
+        r.chance(0)                                         # drawn by every hit that knocks the boss out
+    for sec in secondaries(move):
+        if target == BOSS and sec.get("volatileStatus") == "flinch":
+            continue                                        # the boss cannot flinch: no draw
+        if r.chance(sec["chance"]):
+            raise Unsupported("a secondary effect")
     if target == BOSS:
         share = lambda hp: hp * 100 / battle.full[BOSS]
         if any(share(battle.hp[BOSS] - dmg) <= t < share(battle.hp[BOSS]) for t in battle.triggers):
@@ -215,6 +218,8 @@ def use(battle, actor, number, position, order):
     if code > 7:
         q += queue.encode(0x20, (actor, 24))
     q += queue.encode(0x42, (target, actor, apos, mtype, cat, number, dmg))
+    if knockout:
+        q += boss_down(battle, actor, number)
     if "drain" in move:
         n, d = move["drain"]
         heal = min(int(dmg * n / d + 0.5), battle.full[actor] - battle.hp[actor])
@@ -233,6 +238,17 @@ def use(battle, actor, number, position, order):
     q += queue.encode(0x1E, (actor, 0))
     order.append(actor)
     return q
+
+
+def boss_down(battle, actor, number):
+    """The boss knocked out, after the hit's record: the battle is won."""
+    q = queue.encode(0x49, (BOSS, actor, number)) + queue.encode(0x09, (actor, 0))
+    q += queue.encode(0x37, (BOSS, 1, 1)) + message(BOSS, 0, BOSS) + queue.encode(0x94, (BOSS, 0))
+    q += queue.encode(0x37, (BOSS, 8, 1))
+    q += b"".join(queue.encode(c, (BOSS,)) for c in (0x5F, 0x62, 0x6C, 0x5D))
+    q += b"".join(queue.encode(0x41, (b, BOSS)) for b in sorted(battle.b) if b != BOSS)
+    q += b"".join(queue.encode(0x33, (BOSS, k)) for k in range(14) if k != 8)
+    return q + queue.encode(0x80, (BOSS,)) + queue.encode(0x29, (BOSS,)) + queue.encode(0x38, (actor,))
 
 
 def callbacks(b):
@@ -273,17 +289,21 @@ def build(battle, slot, command):
             q += b"".join(handler(battle, a, 0) for a in ordered)
         q += handler(battle, (actor, number), 0x72000, last=False)
         q += use(battle, actor, number, position, order)
-    q += queue.encode(0xB2, (0,))
-    q += b"".join(queue.encode(0x37, (a, 7, 1)) for a in order)
-    q += queue.encode(0x75, (3, battle.rounds + 1))
-    q += queue.encode(0xC5, (1,))
-    q += b"".join(queue.encode(0x43, (b,)) for b in ROUND_END_ORDER(battle))
-    acted = range(1, 6) if battle.rounds == 0 else sorted(order)
+        if not battle.hp[BOSS]:
+            break                                           # the boss is down: nobody else moves
+    won = not battle.hp[BOSS]
+    if not won:
+        q += queue.encode(0xB2, (0,))
+        q += b"".join(queue.encode(0x37, (a, 7, 1)) for a in order)
+        q += queue.encode(0x75, (3, battle.rounds + 1))
+        q += queue.encode(0xC5, (1,))
+    q += b"".join(queue.encode(0x43, (b,)) for b in ROUND_END_ORDER(battle) if battle.hp[b])
+    acted = range(1, 6) if battle.rounds == 0 else sorted(a[0] for a in acts)
     q += b"".join(queue.encode(0x23, (b,)) for b in acted)
     q += queue.encode(0x2D, (0,))
     battle.rounds += 1
     body = action_block(slot, command) + struct.pack("<I", len(q)) + q
-    return body + bytes(BODY - len(body)), False
+    return body + bytes(BODY - len(body)), won
 
 
 def handler(battle, act, base, last=True):

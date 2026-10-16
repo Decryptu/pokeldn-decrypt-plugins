@@ -22,14 +22,20 @@ class Unsupported(Exception):
 
 class Server:
     """One raid battle. `rounds(slot, command, server)` -> (the round body, action block and queue, for
-    a slot's type-6 command; whether that round wins the battle), or raises Unsupported."""
+    a slot's type-6 command; whether that round wins the battle), or raises Unsupported; by default the
+    rounds are built (raidbattle.rounds)."""
 
     def __init__(self, bootstrap, partners, rounds=None, start_body=None):
         from raidbattle import battlers, start
-        self.battlers = battlers.from_records(bootstrap, partners)
-        self.start_body = start_body if start_body is not None else start.body(self.battlers)
+        from raidbattle import rounds as built
         if rounds is None:
-            raise Unsupported("rounds are not reproduced yet")
+            battle = battlers.battle(bootstrap, partners)
+            rounds = lambda slot, command, server: built.build(battle, slot, command)
+            self.battlers = battle.b
+            self.start_body = start_body if start_body is not None else start.body(battle.b, None, battle)
+        else:
+            self.battlers = battlers.from_records(bootstrap, partners)
+            self.start_body = start_body if start_body is not None else start.body(self.battlers)
         self.rounds = rounds
         self.t = 0.0
         self.step = 0
