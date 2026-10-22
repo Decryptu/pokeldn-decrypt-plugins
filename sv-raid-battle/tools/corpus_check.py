@@ -59,6 +59,9 @@ def check_rounds(d):
     events = [e for e in d["events"] if e[0] != "draw"]
     commands = [bytes.fromhex(h) for t, io, s, h in events if io == "in" and h[:2] == "06"]
     sent = [m[0x20:] for m in server_messages(d, 0x15)]
+    actions = [i for i, m in enumerate(sent) if m[0x231]]      # the boss's slot: a raid action's round
+    if actions:
+        sent = sent[:actions[0]]
     battle = battlers.battle(bytes.fromhex(d["bootstrap"]), [bytes.fromhex(p) for p in d["partners"]])
     start.body(battle.b, None, battle)
     for n, (command, want) in enumerate(zip(commands, sent)):
@@ -73,6 +76,8 @@ def check_rounds(d):
             a, b = queue.decode(got[0x23c:0x23c + struct.unpack_from("<I", got, 0x238)[0]]), queue.decode(want[0x23c:0x23c + m])
             i = next((i for i in range(min(len(a), len(b))) if a[i] != b[i]), min(len(a), len(b)))
             return "different", f"round {n} command {i}: ours {a[i:i+2]} oracle {b[i:i+2]}"
+    if actions:
+        return "partial", f"{len(sent)} of {len(sent)}; then a raid action"
     return "equal", f"{len(sent)} rounds"
 
 

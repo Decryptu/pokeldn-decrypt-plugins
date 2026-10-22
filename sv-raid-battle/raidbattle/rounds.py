@@ -39,6 +39,11 @@ INNER_FOCUS = 39
 AIR_BALLOON = 541
 SHIELDS_DOWN = 197
 LEVITATE = 26
+ROCK_HEAD, MAGIC_GUARD = 69, 98
+PINCH = {65: "Grass", 66: "Fire", 67: "Water", 68: "Bug"}
+HUGE_POWER, PURE_POWER, ADAPTABILITY = 37, 74, 91
+FOCUS_SASH = 275
+TYPE_BOOSTS = _data("type_boosts.json")
 CONTACT_STATUS = frozenset((9, 38, 49, 56))     # Static, Poison Point, Flame Body, Cute Charm: the target's
 POISON_TOUCH = 143                              # the attacker's
 RATTLED = 155                                   # +1 Speed, hit by a Bug, Dark or Ghost move
@@ -117,7 +122,9 @@ class Battle:
     def stab(self, actor, move_type):
         if actor == BOSS and move_type == self.tera:
             return 2.0 if move_type in self.types[BOSS] else 1.5
-        return 1.5 if move_type in self.types[actor] else 1.0
+        if move_type not in self.types[actor]:
+            return 1.0
+        return 2.0 if self.b[actor].ability == ADAPTABILITY and actor != BOSS else 1.5
 
     def tera_move(self, actor, move):
         """The boss is Terastallized: its moves of its Tera type (0x8b's eighth argument)."""
@@ -135,7 +142,14 @@ class Battle:
         physical = move["category"] == "Physical"
         att = staged(a.stats[1], self.stages[actor][1]) if physical else staged(a.stats[4], self.stages[actor][3])
         dfn = staged(d.stats[2], self.stages[target][2]) if physical else staged(d.stats[5], self.stages[target][4])
-        base = (2 * a.level // 5 + 2) * self.power(actor, move) * att // dfn // 50 + 2
+        if a.ability in PINCH and move["type"] == PINCH[a.ability] and self.hp[actor] * 3 <= self.full[actor]:
+            att = modify(att, 1.5)                          # Showdown: Overgrow, Blaze, Torrent, Swarm
+        if a.ability in (HUGE_POWER, PURE_POWER) and physical:
+            att = modify(att, 2)
+        power = self.power(actor, move)
+        if TYPE_BOOSTS.get(str(a.item)) == move["type"]:
+            power = modify(power, 4915 / 4096)              # Showdown items.ts: Charcoal, Spell Tag and kin
+        base = (2 * a.level // 5 + 2) * power * att // dfn // 50 + 2
         if crit:
             base = modify(base, 1.5)
         x = base * (100 - roll) // 100
@@ -155,7 +169,7 @@ def plain(move):
         raise Unsupported("not a damaging move")
     if move.get("isNonstandard") in ("Past", "LGPE", "Gmax", "Future"):
         raise Unsupported(f"{move['name']} is not a Scarlet / Violet move")   # its game data differs
-    for key in ("multihit", "recoil", "self", "volatileStatus", "status", "boosts"):
+    for key in ("multihit", "self", "volatileStatus", "status", "boosts"):
         if key in move:
             raise Unsupported(f"a move with {key}")
     if set(move["callbacks"]) - IDLE_MOVE_CALLBACKS.get(move["name"], set()):
@@ -166,7 +180,7 @@ def plain(move):
     if move.get("critRatio", 1) not in CRIT_DRAW:
         raise Unsupported("crit stage")
     for sec in secondaries(move):
-        if set(sec) - {"chance", "status", "volatileStatus", "boosts"} or "chance" not in sec:
+        if set(sec) - {"chance", "status", "volatileStatus", "boosts"} or "chance" not in sec or len(sec) == 1:
             raise Unsupported("secondary")
     return move
 
@@ -207,8 +221,9 @@ def use(battle, actor, number, position, order):
     dmg = battle.damage(actor, target, move, roll, crit)
     if dmg >= battle.hp[target] and target != BOSS and not KNOCKOUTS:
         raise Unsupported("a knockout")
-    if dmg >= battle.hp[target] == battle.full[target] and battle.b[target].ability == STURDY:
-        raise Unsupported("Sturdy")
+    if dmg >= battle.hp[target] == battle.full[target] and (battle.b[target].ability == STURDY or
+                                                           battle.b[target].item == FOCUS_SASH):
+        raise Unsupported("Sturdy or Focus Sash")
     dmg = min(dmg, battle.hp[target])
     if battle.b[target].ability == SHIELDS_DOWN and 2 * (battle.hp[target] - dmg) <= battle.full[target]:
         raise Unsupported("Shields Down at half HP")
@@ -289,6 +304,8 @@ def use(battle, actor, number, position, order):
     if knockout:
         q += boss_down(battle, actor, number)
     q += queue.encode(0xD1, bytes([1, 0]))
+    if "recoil" in move:
+        q += recoil(battle, actor, move, dmg, knockout)
     q += queue.encode(0x2E, (2, actor - 1))
     if target == BOSS:
         q += queue.encode(0x85, (7, dmg))
@@ -299,6 +316,22 @@ def use(battle, actor, number, position, order):
     q += queue.encode(0x1E, (actor, 0))
     order.append(actor)
     return q
+
+
+def recoil(battle, actor, move, dmg, knockout):
+    """Recoil: damage times the move's fraction, rounded half up, at least 1; 0x01 (A, A, r, 4),
+    0x9a (A, -r), message 127, 0x37 (A, 4, r)."""
+    n, d = move["recoil"]
+    r = max(1, int(dmg * n / d + 0.5))
+    if knockout or r >= battle.hp[actor] or battle.b[actor].ability in (ROCK_HEAD, MAGIC_GUARD):
+        raise Unsupported("recoil that faints, after a knockout, or under Rock Head or Magic Guard")
+    if actor == BOSS:
+        share = lambda hp: hp * 100 // battle.full[BOSS]
+        if any(share(battle.hp[BOSS] - r) <= t < share(battle.hp[BOSS]) for t in battle.triggers):
+            raise Unsupported("a boss HP trigger")
+    battle.hp[actor] -= r
+    q = queue.encode(0x01, (actor, actor, r, 4)) + queue.encode(0x9A, (actor, -r & 0xFFFFFFFF))
+    return q + message(actor, 127, actor) + queue.encode(0x37, (actor, 4, r))
 
 
 def immune(battle, actor, target, number, move, position, order):
@@ -463,7 +496,6 @@ WHEN = {
     274: lambda battle, b, out, inc, every: any("wind" in m["flags"] for m in inc),
     19: lambda battle, b, out, inc, every: any(secondaries(m) for m in inc),
     125: lambda battle, b, out, inc, every: any(secondaries(m) for m in out),
-    65: _pinch("Grass"), 66: _pinch("Fire"), 67: _pinch("Water"), 68: _pinch("Bug"),
     55: lambda battle, b, out, inc, every: any(m["category"] == "Physical" for m in out),
     91: lambda battle, b, out, inc, every: any(battle.stab(b.id, m["type"]) > 1 for m in out),
     101: lambda battle, b, out, inc, every: any(battle.power(b.id, m) <= 60 for m in out),
@@ -494,12 +526,20 @@ def callbacks(b, battle=None, acts=()):
             live = set()
     if b.ability == STALL:
         live.discard("onFractionalPriority")
+    if b.ability in PINCH or b.ability in (HUGE_POWER, PURE_POWER):
+        live -= {"onModifyAtk", "onModifySpA"}             # Battle.damage applies them
+    if b.ability == ADAPTABILITY and b.id != BOSS:
+        live.discard("onModifySTAB")
     if b.ability in CONTACT_STATUS or b.ability == RATTLED:
         live.discard("onDamagingHit")                   # use() draws it
     if b.ability == POISON_TOUCH:
         live.discard("onSourceDamagingHit")
     if b.item and b.item not in IDLE_ITEMS:
         item = set(ITEMS.get(str(b.item), ["unknown"]))
+        if str(b.item) in TYPE_BOOSTS:
+            item.discard("onBasePower")                     # Battle.damage applies it
+        if b.item == FOCUS_SASH:
+            item.discard("onDamage")                        # use() refuses the hit it would survive
         live |= item - INERT | item & {"onUpdate"}       # a berry eats on its update
     return live
 
@@ -539,7 +579,10 @@ def build(battle, slot, command):
     if not won:
         q += queue.encode(0xB2, (0,))
         q += b"".join(queue.encode(0x37, (a, 7, 1)) for a in order)
-        q += queue.encode(0x75, (3, battle.rounds + 1))
+        n = (battle.rounds + 1) % TURN
+        q += queue.encode(0x75, (3, n))
+        if n == 0:
+            q += turn_end(battle)
         q += queue.encode(0xC5, (1,))
     q += b"".join(queue.encode(0x43, (b,)) for b in ROUND_END_ORDER(battle) if battle.hp[b])
     acted = range(1, 6) if battle.rounds == 0 else sorted(a[0] for a in acts)
@@ -578,6 +621,28 @@ def weather_check(battle, acts):
         if "snow" in battle.field and move["category"] == "Physical" and target and \
                 "Ice" in battle.defending(target):
             raise Unsupported("an Ice-type target in snow")
+
+
+TURN = 4                    # a turn ends every fourth command round
+# the end-of-turn residual kinds, in the order 0x19 runs them
+RESIDUALS = (36, 21, 18, 5, 4, 9, 10, 8, 46, 43, 48, 11, 12, 23, 13, 31, 33, 15, 19, 29, 30, 38, 37, 39, 40, 41,
+             24, 45, 14, 20, 1, 2, 3, 7, 6, 16, 17, 22, 25, 26, 27, 28, 32, 34, 35)
+LEFTOVERS = 234
+
+
+def turn_end(battle):
+    """A turn's end with nothing to resolve: 0xc5 (0), 0x50 (0), 0x19 (b, kind) for each residual kind
+    over the battlers in speed order, 0x44 (1 to 13)."""
+    for b in battle.b.values():
+        if b.item == LEFTOVERS and battle.hp[b.id] < battle.full[b.id]:
+            raise Unsupported("Leftovers at the turn's end")
+        live = callbacks(b) & {"onResidual"}
+        if live or battle.field:
+            raise Unsupported(f"battler {b.id}'s residual at the turn's end")
+    order = ROUND_END_ORDER(battle)
+    q = queue.encode(0xC5, (0,)) + queue.encode(0x50, (0,))
+    q += b"".join(queue.encode(0x19, (b, k)) for k in RESIDUALS for b in order if battle.hp[b])
+    return q + b"".join(queue.encode(0x44, (k,)) for k in range(1, 14))
 
 
 def handler(battle, act, base, last=True):
