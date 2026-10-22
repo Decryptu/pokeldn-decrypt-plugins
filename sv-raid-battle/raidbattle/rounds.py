@@ -36,6 +36,7 @@ KNOCKOUTS = False            # set by the spec tools while knockouts are built
 PRESSURE = 46               # a move aimed at it spends 2 PP: 0x05 (b, 0, 2)
 STURDY = 5
 STALL = 100                 # moves last in its bracket; 0x51 (b, 0) in the speed pass
+TARGET_CLASS = {"allAdjacent": 4, "allAdjacentFoes": 5}     # 0x8b's ninth argument; 0 for one target
 EFFECTIVENESS = {0.25: 5, 0.5: 6, 1: 7, 2: 8, 4: 9}
 
 
@@ -86,6 +87,10 @@ class Battle:
         self.triggers = frozenset()                     # boss HP shares its profile acts at
         self.stages = {i: [0] * 8 for i in battlers}     # stat stages by stat index (1 Atk ... 5 Spe, 6 acc, 7 eva)
         self.field = set()                              # "sun", "rain", "snow", "sand", "terrain", set at the start
+
+    def speed(self, battler):
+        """The Speed the turn order reads: the stat at its stage."""
+        return staged(self.b[battler].speed, self.stages[battler][5])
 
     def defending(self, target):
         return [self.tera] if target == BOSS else self.types[target]
@@ -143,8 +148,9 @@ def plain(move):
             raise Unsupported(f"a move with {key}")
     if set(move["callbacks"]) - IDLE_MOVE_CALLBACKS.get(move["name"], set()):
         raise Unsupported(f"{move['name']}'s {move['callbacks'][0]}")
-    if move["target"] not in ("normal", "any") or move.get("priority", 0):   # "any": one target, any position
-        raise Unsupported(f"target {move['target']} or priority")
+    # "any": one target, any position; a spread move hits only the commanded position in a raid
+    if move["target"] not in ("normal", "any", "allAdjacent", "allAdjacentFoes"):
+        raise Unsupported(f"target {move['target']}")
     if move.get("critRatio", 1) not in CRIT_DRAW:
         raise Unsupported("crit stage")
     for sec in secondaries(move):
@@ -196,7 +202,7 @@ def use(battle, actor, number, position, order):
                 raise Unsupported("a secondary effect")
             drops += stat_drop(battle, actor, target, sec["boosts"])
     if target == BOSS:
-        share = lambda hp: hp * 100 / battle.full[BOSS]
+        share = lambda hp: hp * 100 // battle.full[BOSS]     # integer division, as the time triggers
         if any(share(battle.hp[BOSS] - dmg) <= t < share(battle.hp[BOSS]) for t in battle.triggers):
             raise Unsupported("a boss HP trigger")
     battle.hp[target] -= dmg
@@ -217,7 +223,8 @@ def use(battle, actor, number, position, order):
     q += queue.encode(0x7E, (0, *hit))
     q += queue.encode(0x7E, (1, 0, 0, 0, 0, 0))
     q += queue.encode(0x7E, (2, *e5))
-    q += queue.encode(0x8B, (apos, tpos, number, mtype, 0, 0, 1, int(battle.tera_move(actor, move)), 0, 0))
+    q += queue.encode(0x8B, (apos, tpos, number, mtype, 0, 0, 1, int(battle.tera_move(actor, move)),
+                             TARGET_CLASS.get(move["target"], 0), 0))
     q += queue.encode(0x37, (target, 2, dmg)) + queue.encode(0x37, (target, 5, 1))
     q += queue.encode(0x02, (target, actor, dmg, 3))
     q += queue.encode(0xD0, bytes([target, code]))
@@ -230,15 +237,15 @@ def use(battle, actor, number, position, order):
     if code > 7:
         q += queue.encode(0x20, (actor, 24))
     q += queue.encode(0x42, (target, actor, apos, mtype, cat, number, dmg)) + drops
-    if knockout:
-        q += boss_down(battle, actor, number)
     if "drain" in move:
         n, d = move["drain"]
-        heal = min(int(dmg * n / d + 0.5), battle.full[actor] - battle.hp[actor])
-        if heal > 0:
-            battle.hp[actor] += heal
+        heal = int(dmg * n / d + 0.5)                       # the commands carry it uncapped
+        if battle.hp[actor] < battle.full[actor] and heal > 0:
+            battle.hp[actor] = min(battle.full[actor], battle.hp[actor] + heal)
             q += queue.encode(0xA7, (target, 51)) + queue.encode(0x03, (actor, heal))
             q += queue.encode(0x9A, (actor, heal)) + message(actor, 290, target)
+    if knockout:
+        q += boss_down(battle, actor, number)
     q += queue.encode(0xD1, bytes([1, 0]))
     q += queue.encode(0x2E, (2, actor - 1))
     if target == BOSS:
@@ -367,11 +374,12 @@ def build(battle, slot, command):
             live = {k for k in live if k == "onResidual" or k.startswith("onAny")}
         if live:
             raise Unsupported(f"battler {b.id}'s ability {b.ability} or item {b.item}: {sorted(live)[0]}")
-    speed = lambda a: battle.b[a[0]].speed
+    speed = lambda a: battle.speed(a[0])
     by_id = sorted(acts, key=lambda a: a[0])
     last = lambda a: battle.b[a[0]].ability == STALL
-    ordered = sorted(acts, key=lambda a: (last(a), -speed(a)))
-    if len({speed(a) for a in acts}) != len(acts):
+    priority = lambda a: (MOVES.get(a[1]) or {}).get("priority", 0)
+    ordered = sorted(acts, key=lambda a: (-priority(a), last(a), -speed(a)))
+    if len({(priority(a), speed(a)) for a in acts}) != len(acts):
         raise Unsupported("a speed tie")
     q = queue.encode(0xB5, (0,))
     for run, pass_ in ((by_id, 0), (ordered, 1)):
@@ -442,10 +450,10 @@ def handler(battle, act, base, last=True):
 
 def ROUND_END_ORDER(battle):
     """The battlers in speed order."""
-    speeds = [battle.b[b].speed for b in battle.b]
+    speeds = [battle.speed(b) for b in battle.b]
     if len(set(speeds)) != len(speeds):
         raise Unsupported("a speed tie at the round's end")
-    return sorted(battle.b, key=lambda b: -battle.b[b].speed)
+    return sorted(battle.b, key=lambda b: -battle.speed(b))
 
 
 _probe = _data("handler_moves.json")

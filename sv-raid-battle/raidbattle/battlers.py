@@ -44,6 +44,7 @@ def from_records(bootstrap, partners):
 
 
 TYPE_NONE = 19
+MULTITYPE, RKS_SYSTEM = 121, 225
 
 
 def battle(bootstrap, partners):
@@ -60,6 +61,12 @@ def battle(bootstrap, partners):
     except KeyError as e:
         from raidbattle.server import Unsupported
         raise Unsupported(f"species {e} has no personal entry") from None
+    for i, x in b.items():
+        if x.ability in (MULTITYPE, RKS_SYSTEM):    # Showdown: the type follows the plate or memory held
+            if {"onPlate", "onMemory"} & set(rounds.ITEMS.get(str(x.item)) or ()):
+                from raidbattle.server import Unsupported
+                raise Unsupported(f"battler {i} holds a type item")
+            types[i] = ["Normal"]
     boss = gen9.read(gen9.decrypt(bytes(bootstrap[4 * PARTY_RECORD:5 * PARTY_RECORD])))
     tera = boss["tera_type_override"] if boss["tera_type_override"] != TYPE_NONE else boss["tera_type_original"]
     from raidbattle import start
