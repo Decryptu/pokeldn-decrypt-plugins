@@ -24,6 +24,11 @@ TERRAIN = {228: (2, 706, 0xCA), 226: (3, 708, 0xCA), 227: (4, 828, 0xCA), 289: (
 # quiet at switch-in in the oracle corpus, beyond battlers.QUIET_ABILITIES
 QUIET_TOO = frozenset({21, 40, 73, 90, 134, 147, 179, 183, 192, 205, 209, 230, 240, 264, 275, 293, 308})
 AIR_BALLOON = 541
+TRACE = 36
+# Showdown abilities.ts, flags failstrace and notrace: never copied
+UNTRACEABLE = frozenset({36, 59, 121, 122, 149, 150, 161, 176, 197, 208, 209, 210, 211, 213, 222, 223, 225, 248, 256,
+                         258, 266, 267, 278, 279, 281, 282, 301, 302, 303, 304, 307, 308, 309, 310})
+SHIELDS_DOWN, MINIOR_CORE = 197, 7          # Minior's forms 0-6 Meteor, 7-13 Core; Meteor above half HP is quiet
 QUIET_ITEMS = frozenset({0, 234, 247, 270, 275})
 MESSAGE_PRESSURE, MESSAGE_AIR_BALLOON = 162, 137
 END = 0xFFFF0000
@@ -37,7 +42,7 @@ def message(battler, text, *params):
 
 def send_out(b):
     return b"".join([queue.encode(0x3D, (b.id - 1,)), queue.encode(0x16, (b.id - 1, 0, 0, 0)),
-                     queue.encode(0x5E, (b.id, b.ability)), queue.encode(0x61, (b.id,)),
+                     queue.encode(0x5E, (b.id, b.base_ability or b.ability)), queue.encode(0x61, (b.id,)),
                      queue.encode(0x6B, (b.id,)), queue.encode(0x4E, (b.id,))])
 
 
@@ -154,10 +159,38 @@ def frisk(b, battlers):
     return ability_event(b, out)
 
 
+def trace(battlers, battle):
+    """Trace copies a foe's ability once, before the switch-in events: a player's the boss's, the boss's
+    one of the players picked by below(4) in id order. Only an ability quiet at switch-in is copied."""
+    for b in sorted(battlers.values(), key=lambda b: b.id):
+        if b.ability != TRACE or b.base_ability:
+            continue
+        players = [battlers[i] for i in sorted(battlers) if i != BOSS]
+        if b.id != BOSS:
+            source = battlers[BOSS]
+        elif battle is None:
+            raise Unsupported("the boss's Trace needs the battle's generator")
+        else:
+            source = players[battle.rng.below(len(players))]
+        if source.ability not in QUIET_ABILITIES | QUIET_TOO | {OWN_TEMPO, INNER_FOCUS} or source.ability in UNTRACEABLE:
+            raise Unsupported(f"battler {b.id}'s Trace copies ability {source.ability}")
+        b.base_ability, b.ability, b.traced_from = TRACE, source.ability, source.id
+
+
+def traced(b):
+    """Trace's event: 0x89 names it, message 128 the source, 0x24 and 0x5e set the copied ability."""
+    a = b.ability
+    body = queue.encode(0x89, (b.id, TRACE, a)) + message(b.id, 128, b.traced_from, a) + queue.encode(0x5F, (b.id,))
+    body += queue.encode(0x24, (b.id, a)) + queue.encode(0x5E, (b.id, a)) + queue.encode(0xC8, (b.id,))
+    return ability_event(b, body, a)
+
+
 def switch_in(b, battlers, stages, battle=None):
     out = b""
     field = battle.field if battle is not None else set()
-    if b.ability == ANTICIPATION:
+    if b.base_ability == TRACE:
+        out += traced(b)
+    elif b.ability == ANTICIPATION:
         out += anticipation(b, battlers, battle)
     elif b.ability == UNNERVE:
         pass
@@ -183,6 +216,9 @@ def switch_in(b, battlers, stages, battle=None):
         out += weather(b, field)
     elif b.ability in TERRAIN:
         out += terrain(b, field)
+    elif b.ability == SHIELDS_DOWN:
+        if b.form >= MINIOR_CORE or 2 * b.hp <= b.stats[0]:
+            raise Unsupported(f"battler {b.id}'s Shields Down changes its form")   # Core form: its stats change
     elif b.ability not in QUIET_ABILITIES | QUIET_TOO | {OWN_TEMPO, INNER_FOCUS}:
         raise Unsupported(f"battler {b.id}'s ability {b.ability} acts on switch-in")
     if b.item == AIR_BALLOON:
@@ -196,6 +232,7 @@ def body(battlers, stages=None, battle=None):
     """-> the 0x11 body for {id: Battler}; `stages` ({id: [0] * 8}) gets the stat stages it sets;
     `battle` (rounds.Battle) gives the types Anticipation reads."""
     stages = stages if stages is not None else {i: [0] * 8 for i in battlers}
+    trace(battlers, battle)
     ordered = sorted(battlers.values(), key=lambda b: -b.speed)
     acting = [b for b in ordered if switch_in(b, battlers, {i: [0] * 8 for i in battlers}, battle)]
     speeds = [b.speed for b in acting]

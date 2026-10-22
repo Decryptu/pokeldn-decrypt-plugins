@@ -37,6 +37,7 @@ PRESSURE = 46               # a move aimed at it spends 2 PP: 0x05 (b, 0, 2)
 STURDY = 5
 INNER_FOCUS = 39
 AIR_BALLOON = 541
+SHIELDS_DOWN = 197
 CONTACT_STATUS = frozenset((9, 38, 49, 56))     # Static, Poison Point, Flame Body, Cute Charm: the target's
 POISON_TOUCH = 143                              # the attacker's
 RATTLED = 155                                   # +1 Speed, hit by a Bug, Dark or Ghost move
@@ -197,6 +198,8 @@ def use(battle, actor, number, position, order):
     if dmg >= battle.hp[target] == battle.full[target] and battle.b[target].ability == STURDY:
         raise Unsupported("Sturdy")
     dmg = min(dmg, battle.hp[target])
+    if battle.b[target].ability == SHIELDS_DOWN and 2 * (battle.hp[target] - dmg) <= battle.full[target]:
+        raise Unsupported("Shields Down at half HP")
     knockout = target == BOSS and dmg == battle.hp[target]
     if knockout:
         r.chance(0)                                         # drawn by every hit that knocks the boss out
