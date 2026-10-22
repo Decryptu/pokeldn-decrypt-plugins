@@ -28,13 +28,13 @@ INERT = {"onStart", "onEnd", "onSwitchIn", "onSwitchOut", "onAnySwitchIn", "onDe
          "onWeather", "onWeatherChange", "onAnySetWeather", "onTerrainChange", "onAllyFaint",
          "onSourceAfterFaint", "onFaint", "onUpdate", "condition"}
 # abilities and items whose callbacks did not fire in any plain first round of the oracle corpus
-IDLE_ABILITIES = frozenset((3, 29, 33, 34, 44, 47, 49, 53, 77, 81, 84, 87, 124, 137, 141, 158, 232, 246, 298,
-                            304))
+IDLE_ABILITIES = frozenset((3, 29, 33, 34, 44, 53, 77, 81, 84, 137, 141, 158, 232, 246, 298, 304))
 IDLE_ITEMS = frozenset((234, 541))
 # move callbacks that cannot fire in a plain round (Facade: a status the round never sets)
 IDLE_MOVE_CALLBACKS = {"Facade": {"onBasePower"}}
 KNOCKOUTS = False            # set by the spec tools while knockouts are built
 PRESSURE = 46               # a move aimed at it spends 2 PP: 0x05 (b, 0, 2)
+STURDY = 5
 STALL = 100                 # moves last in its bracket; 0x51 (b, 0) in the speed pass
 EFFECTIVENESS = {0.25: 5, 0.5: 6, 1: 7, 2: 8, 4: 9}
 
@@ -84,7 +84,8 @@ class Battle:
         self.hp = {i: b.hp for i, b in battlers.items()}
         self.full = {i: b.stats[0] for i, b in battlers.items()}
         self.triggers = frozenset()                     # boss HP shares its profile acts at
-        self.stages = {i: [0] * 8 for i in battlers}     # stat stages by stat index (1 Atk ... 5 Spe)
+        self.stages = {i: [0] * 8 for i in battlers}     # stat stages by stat index (1 Atk ... 5 Spe, 6 acc, 7 eva)
+        self.field = set()                              # "weather", "terrain": set at the start, never built in rounds
 
     def defending(self, target):
         return [self.tera] if target == BOSS else self.types[target]
@@ -161,6 +162,8 @@ def use(battle, actor, number, position, order):
     move = plain(MOVES.get(number))
     target = BATTLER_AT[position]
     r = battle.rng
+    if isinstance(move["accuracy"], int) and (battle.stages[actor][6] or battle.stages[target][7]):
+        raise Unsupported("an accuracy or evasion stage")
     if isinstance(move["accuracy"], int) and not r.chance(move["accuracy"]):
         raise Unsupported("a miss")
     crit = r.below(CRIT_DRAW[move.get("critRatio", 1)]) == 0
@@ -174,6 +177,8 @@ def use(battle, actor, number, position, order):
     dmg = battle.damage(actor, target, move, roll, crit)
     if dmg >= battle.hp[target] and target != BOSS and not KNOCKOUTS:
         raise Unsupported("a knockout")
+    if dmg >= battle.hp[target] == battle.full[target] and battle.b[target].ability == STURDY:
+        raise Unsupported("Sturdy")
     dmg = min(dmg, battle.hp[target])
     knockout = target == BOSS and dmg == battle.hp[target]
     if knockout:
@@ -251,9 +256,63 @@ def boss_down(battle, actor, number):
     return q + queue.encode(0x80, (BOSS,)) + queue.encode(0x29, (BOSS,)) + queue.encode(0x38, (actor,))
 
 
-def callbacks(b):
-    """The live callbacks of a battler's ability and held item, less those measured idle in plain rounds."""
+_never = lambda battle, b, out, inc, every: False
+_aimed = lambda *types: lambda battle, b, out, inc, every: any(m["type"] in types for m in inc)
+_aimed_any = lambda *types: lambda battle, b, out, inc, every: any(m["type"] in types for m in every)
+_using = lambda *types: lambda battle, b, out, inc, every: any(m["type"] in types for m in out)
+_contact = lambda battle, b, out, inc, every: any("contact" in m["flags"] for m in inc)
+_pinch = lambda t: lambda battle, b, out, inc, every: battle.hp[b.id] * 3 <= battle.full[b.id] and \
+    any(m["type"] == t for m in out)
+# Showdown abilities.ts: what each ability's callbacks need before they act; with no status, weather,
+# confusion, flinch or critical hit in a plain round, many never do. (battle, b, its moves, moves aimed
+# at it, every move) -> whether they can act.
+WHEN = {
+    4: _never, 75: _never,                                          # Battle Armor, Shell Armor: no crit
+    5: _never,                                                      # Sturdy: use() refuses its knockout
+    8: _never, 94: _never,                                          # Sand Veil, Solar Power: weather
+    12: _never, 20: _never,                                         # Oblivious, Own Tempo: attraction, confusion
+    28: _never, 30: _never, 61: _never, 62: _never, 63: _never, 93: _never, 95: _never, 131: _never,  # status
+    51: _never,                                                     # Keen Eye: use() refuses evasion stages
+    80: _never, 83: _never,                                         # Steadfast, Anger Point: flinch, crit
+    104: _never, 163: _never, 164: _never,                          # mold breakers: a target ability refuses
+    9: _contact, 24: _contact, 27: _contact, 38: _contact, 49: _contact, 56: _contact, 124: _contact,
+    160: _contact,
+    10: _aimed("Electric"), 78: _aimed("Electric"), 11: _aimed("Water"), 18: _aimed("Fire"),
+    85: _aimed("Fire"), 47: _aimed("Fire", "Ice"), 87: _aimed("Water", "Fire"), 157: _aimed("Grass"),
+    155: _aimed("Bug", "Dark", "Ghost"), 31: _aimed_any("Electric"), 114: _aimed_any("Water"),
+    277: lambda battle, b, out, inc, every: any("wind" in m["flags"] for m in inc),
+    274: lambda battle, b, out, inc, every: any("wind" in m["flags"] for m in inc),
+    19: lambda battle, b, out, inc, every: any(secondaries(m) for m in inc),
+    125: lambda battle, b, out, inc, every: any(secondaries(m) for m in out),
+    65: _pinch("Grass"), 66: _pinch("Fire"), 67: _pinch("Water"), 68: _pinch("Bug"),
+    55: lambda battle, b, out, inc, every: any(m["category"] == "Physical" for m in out),
+    91: lambda battle, b, out, inc, every: any(battle.stab(b.id, m["type"]) > 1 for m in out),
+    101: lambda battle, b, out, inc, every: any(battle.power(b.id, m) <= 60 for m in out),
+    143: lambda battle, b, out, inc, every: any("contact" in m["flags"] for m in out),
+    177: _using("Flying"),
+    109: None, 132: None, 140: None,                                # Unaware, Friend Guard, Telepathy: callbacks()
+}
+
+
+def callbacks(b, battle=None, acts=()):
+    """The live callbacks of a battler's ability and held item, less those measured idle in plain rounds
+    and those whose condition (WHEN) the round's moves do not meet."""
     live = set() if b.ability in IDLE_ABILITIES else set(ABILITIES.get(str(b.ability), ["unknown"])) - INERT
+    if b.ability in WHEN and battle is not None:
+        move = lambda n: MOVES.get(n) or {"type": "", "flags": {}, "category": "", "basePower": 0}
+        out = [move(n) for a, n, p in acts if a == b.id]
+        inc = [move(n) for a, n, p in acts if BATTLER_AT.get(p) == b.id]
+        allies = [a for a, n, p in acts if BATTLER_AT.get(p) == b.id and (a == BOSS) == (b.id == BOSS)]
+        if b.ability == 140:                                        # Telepathy: an ally's move
+            live = live if allies else set()
+        elif b.ability == 109:                                      # Unaware: a stat stage in play
+            ids = {a for a, n, p in acts} | {BATTLER_AT.get(p) for a, n, p in acts}
+            live = live if any(any(battle.stages[i][1:5]) for i in ids if i in battle.stages) else set()
+        elif b.ability == 132:                                      # Friend Guard: an ally is hit
+            hit = {BATTLER_AT.get(p) for a, n, p in acts} - {b.id, None}
+            live = live if any((i == BOSS) == (b.id == BOSS) for i in hit) else set()
+        elif not WHEN[b.ability](battle, b, out, inc, [move(n) for a, n, p in acts]):
+            live = set()
     if b.ability == STALL:
         live.discard("onFractionalPriority")
     if b.item and b.item not in IDLE_ITEMS:
@@ -264,10 +323,12 @@ def callbacks(b):
 
 def build(battle, slot, command):
     """-> (the round body for `slot`'s command, whether it wins)."""
+    if battle.field:
+        raise Unsupported(f"{sorted(battle.field)[0]} on the field")
     acts = actions(command)
     involved = {a[0] for a in acts} | {BATTLER_AT[a[2]] for a in acts if a[2] in BATTLER_AT}
     for b in battle.b.values():
-        live = callbacks(b)
+        live = callbacks(b, battle, acts)
         if b.id not in involved:
             live = {k for k in live if k == "onResidual" or k.startswith("onAny")}
         if live:

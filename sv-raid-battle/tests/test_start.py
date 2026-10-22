@@ -1,4 +1,4 @@
-"""The battle-start body against 40 an oracle server sent: equal, or refused; never different."""
+"""The battle-start body against 62 an oracle server sent: equal, or refused; never different."""
 import json
 from pathlib import Path
 
@@ -23,4 +23,4 @@ def test_every_start_is_equal_or_refused():
             continue
         assert got.hex() == case["start"]
         equal += 1
-    assert equal >= 20
+    assert equal >= 56

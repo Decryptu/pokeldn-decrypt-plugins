@@ -32,7 +32,10 @@ game's battle server kept in a pokeldn checkout's `scratchpad/battle/oracle` (fo
 | step | what | state |
 |---|---|---|
 | 1 | random numbers, the command queue codec, message headers | done: draws equal the oracle's on 300 seeds; 20 recorded queues round-trip |
-| 2 | the battle start and one plain damaging move on the boss, byte for byte with a recorded round | done: start bodies 144 of 233 equal; first rounds 19 of 232 equal, 9 different (moves with handlers, switch-in stat changes), the rest refused; the server's flow equals the oracle's over 9 whole battles |
-| 3 | damage, accuracy, critical hits, the type chart, Tera | open |
-| 4 | status moves, stat stages, the common abilities and items | open |
-| 5 | fainting, the timer, the boss's actions and shield, the battle's end | open |
+| 2 | the battle start and one plain damaging move on the boss, byte for byte with a recorded round | done |
+| 3 | damage, accuracy, critical hits, the type chart, Tera | built: damage, stat stages, the type chart, STAB, Tera-type boss moves, accuracy draws; refused: critical hits, misses, accuracy or evasion stages |
+| 4 | status moves, stat stages, the common abilities and items | built: 27 switch-in abilities (Intimidate, Download, weather, terrain, stat raises, announcements), abilities whose condition a round's moves do not meet; refused: status moves, weather and terrain in rounds, abilities that act |
+| 5 | fainting, the timer, the boss's actions and shield, the battle's end | built: the boss knocked out wins the battle; refused: a partner knocked out, a boss HP trigger |
+
+Over the 554 oracle battles of corpora `c1`, `d2` and `p1`: start bodies 512 equal, first rounds 95 equal,
+whole battles 29 equal and 67 equal up to a refused round; none different.
