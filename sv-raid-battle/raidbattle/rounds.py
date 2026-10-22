@@ -35,6 +35,10 @@ IDLE_MOVE_CALLBACKS = {"Facade": {"onBasePower"}}
 KNOCKOUTS = False            # set by the spec tools while knockouts are built
 PRESSURE = 46               # a move aimed at it spends 2 PP: 0x05 (b, 0, 2)
 STURDY = 5
+INNER_FOCUS = 39
+CONTACT_STATUS = frozenset((9, 38, 49, 56))     # Static, Poison Point, Flame Body, Cute Charm: the target's
+POISON_TOUCH = 143                              # the attacker's
+RATTLED = 155                                   # +1 Speed, hit by a Bug, Dark or Ghost move
 STALL = 100                 # moves last in its bracket; 0x51 (b, 0) in the speed pass
 TARGET_CLASS = {"allAdjacent": 4, "allAdjacentFoes": 5}     # 0x8b's ninth argument; 0 for one target
 EFFECTIVENESS = {0.25: 5, 0.5: 6, 1: 7, 2: 8, 4: 9}
@@ -193,14 +197,19 @@ def use(battle, actor, number, position, order):
         r.chance(0)                                         # drawn by every hit that knocks the boss out
     drops = b""
     for sec in secondaries(move):
-        if target == BOSS and sec.get("volatileStatus") == "flinch":
-            continue                                        # the boss cannot flinch: no draw
+        if sec.get("volatileStatus") == "flinch" and (target == BOSS or battle.b[target].ability == INNER_FOCUS):
+            continue                                        # the boss, or Inner Focus, cannot flinch: no draw
         if sec.get("volatileStatus") == "confusion":
             r.skip()                                        # one step before the chance (oracle draw replay)
         if r.chance(sec["chance"]):
+            if sec.get("volatileStatus") == "flinch" and target in order and not knockout:
+                continue                                    # a target that already moved: nothing shows
             if set(sec) != {"chance", "boosts"} or knockout:
                 raise Unsupported("a secondary effect")
             drops += stat_drop(battle, actor, target, sec["boosts"])
+    if "contact" in move["flags"] and (battle.b[target].ability in CONTACT_STATUS or battle.b[actor].ability == POISON_TOUCH):
+        if r.chance(30):                                    # Showdown: randomChance(3, 10) on contact, after the secondaries
+            raise Unsupported("a contact ability's status")
     if target == BOSS:
         share = lambda hp: hp * 100 // battle.full[BOSS]     # integer division, as the time triggers
         if any(share(battle.hp[BOSS] - dmg) <= t < share(battle.hp[BOSS]) for t in battle.triggers):
@@ -236,7 +245,14 @@ def use(battle, actor, number, position, order):
         q += queue.encode(0xCA, (actor, 574 if weak else 575, END) + (0,) * 7)
     if code > 7:
         q += queue.encode(0x20, (actor, 24))
-    q += queue.encode(0x42, (target, actor, apos, mtype, cat, number, dmg)) + drops
+    q += queue.encode(0x42, (target, actor, apos, mtype, cat, number, dmg))
+    if battle.b[target].ability == RATTLED and move["type"] in ("Bug", "Dark", "Ghost") and not knockout:
+        if drops or battle.stages[target][5] == 6:
+            raise Unsupported("Rattled with a stat drop or at +6")
+        battle.stages[target][5] += 1
+        q += queue.encode(0x25, (target,)) + queue.encode(0xC7, (target, 0)) + queue.encode(0x0C, (target, 5, 1))
+        q += queue.encode(0x92, (target, 5, 1, 0)) + message(target, 15, target) + queue.encode(0xC8, (target,))
+    q += drops
     if "drain" in move:
         n, d = move["drain"]
         heal = int(dmg * n / d + 0.5)                       # the commands carry it uncapped
@@ -357,6 +373,10 @@ def callbacks(b, battle=None, acts=()):
             live = set()
     if b.ability == STALL:
         live.discard("onFractionalPriority")
+    if b.ability in CONTACT_STATUS or b.ability == RATTLED:
+        live.discard("onDamagingHit")                   # use() draws it
+    if b.ability == POISON_TOUCH:
+        live.discard("onSourceDamagingHit")
     if b.item and b.item not in IDLE_ITEMS:
         item = set(ITEMS.get(str(b.item), ["unknown"]))
         live |= item - INERT | item & {"onUpdate"}       # a berry eats on its update
@@ -444,7 +464,7 @@ def handler(battle, act, base, last=True):
     actor, number = act[0], act[1]
     if number not in HANDLER_MOVES:
         return b""
-    q = queue.encode(0x5A, (actor, number, base + battle.b[actor].speed))
+    q = queue.encode(0x5A, (actor, number, base + battle.speed(actor)))
     return q + queue.encode(0x5B, (actor, number)) if last else q
 
 
