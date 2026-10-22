@@ -38,6 +38,7 @@ STURDY = 5
 INNER_FOCUS = 39
 AIR_BALLOON = 541
 SHIELDS_DOWN = 197
+LEVITATE = 26
 CONTACT_STATUS = frozenset((9, 38, 49, 56))     # Static, Poison Point, Flame Body, Cute Charm: the target's
 POISON_TOUCH = 143                              # the attacker's
 RATTLED = 155                                   # +1 Speed, hit by a Bug, Dark or Ghost move
@@ -93,6 +94,11 @@ class Battle:
         self.triggers = frozenset()                     # boss HP shares its profile acts at
         self.stages = {i: [0] * 8 for i in battlers}     # stat stages by stat index (1 Atk ... 5 Spe, 6 acc, 7 eva)
         self.field = set()                              # "sun", "rain", "snow", "sand", "terrain", set at the start
+
+    def slot(self, battler, number):
+        """The move's slot in a player's moveset (0x05, 0x07, 0x08); the boss's is 0."""
+        moves = self.b[battler].moves
+        return moves.index(number) if battler != BOSS and number in moves else 0
 
     def speed(self, battler):
         """The Speed the turn order reads: the stat at its stage."""
@@ -171,6 +177,8 @@ def secondaries(move):
 
 def use(battle, actor, number, position, order):
     """-> the queue for one move use, and the order list gets the actor."""
+    if actor != BOSS and (MOVES.get(number) or {}).get("isNonstandard") == "Unobtainable":
+        raise Unsupported(f"move {number} is not a player's in Scarlet / Violet")   # the Torques: NPC moves
     if (MOVES.get(number) or {}).get("category") == "Status":
         return status_use(battle, actor, number, position, order)
     move = plain(MOVES.get(number))
@@ -178,6 +186,10 @@ def use(battle, actor, number, position, order):
         raise Unsupported(f"move {number} was never probed")
     target = BATTLER_AT[position]
     r = battle.rng
+    if move["type"] == "Ground" and battle.b[target].ability == LEVITATE:
+        raise Unsupported("a Ground move into Levitate")
+    if battle.effectiveness(move["type"], target) == 0:
+        return immune(battle, actor, target, number, move, position, order)
     if type(move["accuracy"]) is int and (battle.stages[actor][6] or battle.stages[target][7]):
         raise Unsupported("an accuracy or evasion stage")
     if type(move["accuracy"]) is int and not r.chance(move["accuracy"]):
@@ -231,8 +243,8 @@ def use(battle, actor, number, position, order):
     hit[tpos] = 1
     q = b""
     if actor != BOSS:
-        q += queue.encode(0x05, (actor, 0, 2 if battle.b[target].ability == PRESSURE else 1))
-    q += queue.encode(0x07, (actor, 0))
+        q += queue.encode(0x05, (actor, battle.slot(actor, number), 2 if battle.b[target].ability == PRESSURE else 1))
+    q += queue.encode(0x07, (actor, battle.slot(actor, number)))
     q += queue.encode(0xC9, (actor, 0, number, tpos, 0))
     q += queue.encode(0x7B, (number, battle.rounds, actor))
     for size in (20, 5, 5, 5, 19, 20):
@@ -281,10 +293,27 @@ def use(battle, actor, number, position, order):
     if target == BOSS:
         q += queue.encode(0x85, (7, dmg))
     q += queue.encode(0x7C, ())
-    q += queue.encode(0x08, (actor, 0))
+    q += queue.encode(0x08, (actor, battle.slot(actor, number)))
     q += queue.encode(0x1D, (actor, tpos, mtype, 1, 0, number, number))
     q += queue.encode(0x5B, (actor, number)) * 2
     q += queue.encode(0x1E, (actor, 0))
+    order.append(actor)
+    return q
+
+
+def immune(battle, actor, target, number, move, position, order):
+    """A damaging move the target's types are immune to: no draw; five zero groups, message 72."""
+    mtype = TYPES.index(move["type"])
+    q = b""
+    if actor != BOSS:
+        q += queue.encode(0x05, (actor, battle.slot(actor, number), 2 if battle.b[target].ability == PRESSURE else 1))
+    q += queue.encode(0x07, (actor, battle.slot(actor, number))) + queue.encode(0xC9, (actor, 0, number, position, 1))
+    q += queue.encode(0x7B, (number, battle.rounds, actor))
+    for size in (20, 5, 5, 5, 19):
+        q += queue.encode_group(0xCF, bytes(size))
+    q += message(actor, 72, target) + queue.encode(0x52, (actor, 3)) + queue.encode(0x08, (actor, battle.slot(actor, number)))
+    q += queue.encode(0x52, (actor, 0)) + queue.encode(0x1D, (actor, position, mtype, 0, 0, number, number))
+    q += queue.encode(0x5B, (actor, number)) * 2 + queue.encode(0x1E, (actor, 0))
     order.append(actor)
     return q
 
@@ -345,8 +374,8 @@ def status_use(battle, actor, number, position, order):
     apos, tpos = POSITION[actor], POSITION[target]
     q = b""
     if actor != BOSS:
-        q += queue.encode(0x05, (actor, 0, 2 if not own and battle.b[target].ability == PRESSURE else 1))
-    q += queue.encode(0x07, (actor, 0))
+        q += queue.encode(0x05, (actor, battle.slot(actor, number), 2 if not own and battle.b[target].ability == PRESSURE else 1))
+    q += queue.encode(0x07, (actor, battle.slot(actor, number)))
     q += queue.encode(0xC9, (actor, 0, number, position, 0))
     q += queue.encode(0x7B, (number, battle.rounds, actor))
     q += queue.encode_group(0xCF, bytes(20))
@@ -359,7 +388,7 @@ def status_use(battle, actor, number, position, order):
     else:
         q += stat_drop(battle, actor, target, move["boosts"])
     q += queue.encode(0x7C, ())
-    q += queue.encode(0x08, (actor, 0))
+    q += queue.encode(0x08, (actor, battle.slot(actor, number)))
     q += queue.encode(0x1D, (actor, position, TYPES.index(move["type"]), 1, 0, number, number))
     q += queue.encode(0x5B, (actor, number)) * 2
     q += queue.encode(0x1E, (actor, 0))

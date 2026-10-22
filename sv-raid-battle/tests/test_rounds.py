@@ -30,4 +30,4 @@ def test_first_rounds_are_equal_or_refused():
             continue
         assert got == unpack(case["round"], rounds.BODY), case["file"]
         equal += 1
-    assert equal >= 182
+    assert equal >= 187
