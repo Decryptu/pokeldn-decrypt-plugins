@@ -36,6 +36,7 @@ KNOCKOUTS = False            # set by the spec tools while knockouts are built
 PRESSURE = 46               # a move aimed at it spends 2 PP: 0x05 (b, 0, 2)
 STURDY = 5
 INNER_FOCUS = 39
+AIR_BALLOON = 541
 CONTACT_STATUS = frozenset((9, 38, 49, 56))     # Static, Poison Point, Flame Body, Cute Charm: the target's
 POISON_TOUCH = 143                              # the attacker's
 RATTLED = 155                                   # +1 Speed, hit by a Bug, Dark or Ghost move
@@ -169,20 +170,24 @@ def secondaries(move):
 
 def use(battle, actor, number, position, order):
     """-> the queue for one move use, and the order list gets the actor."""
+    if (MOVES.get(number) or {}).get("category") == "Status":
+        return status_use(battle, actor, number, position, order)
+    move = plain(MOVES.get(number))
     if number in UNSEEN_MOVES:
         raise Unsupported(f"move {number} was never probed")
-    move = plain(MOVES.get(number))
     target = BATTLER_AT[position]
     r = battle.rng
-    if isinstance(move["accuracy"], int) and (battle.stages[actor][6] or battle.stages[target][7]):
+    if type(move["accuracy"]) is int and (battle.stages[actor][6] or battle.stages[target][7]):
         raise Unsupported("an accuracy or evasion stage")
-    if isinstance(move["accuracy"], int) and not r.chance(move["accuracy"]):
+    if type(move["accuracy"]) is int and not r.chance(move["accuracy"]):
         raise Unsupported("a miss")
     crit = r.below(CRIT_DRAW[move.get("critRatio", 1)]) == 0
     roll = r.below(16)
     if crit:
         raise Unsupported("a critical hit")
     e = battle.effectiveness(move["type"], target)
+    if move["type"] == "Ground" and battle.b[target].item == AIR_BALLOON:
+        raise Unsupported("a Ground move into an Air Balloon")
     if e not in EFFECTIVENESS:
         raise Unsupported(f"effectiveness {e}")
     code = EFFECTIVENESS[e]
@@ -246,6 +251,12 @@ def use(battle, actor, number, position, order):
     if code > 7:
         q += queue.encode(0x20, (actor, 24))
     q += queue.encode(0x42, (target, actor, apos, mtype, cat, number, dmg))
+    if battle.b[target].item == AIR_BALLOON and not (target == BOSS and knockout):
+        if drops:
+            raise Unsupported("an Air Balloon popped with a stat drop")
+        battle.b[target].item = 0                           # popped: message 138, then the item leaves
+        q += message(target, 138, target) + queue.encode(0x1E, (target, 15)) + queue.encode(0x26, (target, 0))
+        q += queue.encode(0x4F, (target, 0)) + queue.encode(0x62, (target,))
     if battle.b[target].ability == RATTLED and move["type"] in ("Bug", "Dark", "Ghost") and not knockout:
         if drops or battle.stages[target][5] == 6:
             raise Unsupported("Rattled with a stat drop or at +6")
@@ -269,6 +280,84 @@ def use(battle, actor, number, position, order):
     q += queue.encode(0x7C, ())
     q += queue.encode(0x08, (actor, 0))
     q += queue.encode(0x1D, (actor, tpos, mtype, 1, 0, number, number))
+    q += queue.encode(0x5B, (actor, number)) * 2
+    q += queue.encode(0x1E, (actor, 0))
+    order.append(actor)
+    return q
+
+
+RAISE_TEXT, DROP_TEXT = {1: 10, 2: 17, 3: 24}, {1: 31, 2: 38}    # + stat: the stat change's message
+
+
+def status_move(battle, move):
+    """A status move whose only effect is stat stages, on its user or one target."""
+    if move.get("isNonstandard") in ("Past", "LGPE", "Gmax", "Future"):
+        raise Unsupported(f"{move['name']} is not a Scarlet / Violet move")
+    if not move.get("boosts") or any(k in move for k in ("self", "volatileStatus", "status", "secondary",
+                                                          "secondaries", "multihit")):
+        raise Unsupported("not a damaging move")
+    if set(move["callbacks"]) - ({"onModifyMove"} if move["name"] == "Growth" else set()):
+        raise Unsupported(f"{move['name']}'s {move['callbacks'][0]}")
+    if move["name"] == "Growth" and battle.field & {"sun"}:
+        raise Unsupported("Growth in the sun")
+    if move["target"] not in ("self", "normal", "any", "allAdjacentFoes"):
+        raise Unsupported(f"target {move['target']}")
+    return move
+
+
+def raise_stats(battle, b, boosts):
+    """A move's raise of its user's stages: 0x0c, 0x92, then message RAISE_TEXT + stat per stat."""
+    x = battle.b[b]
+    if set(ABILITIES.get(str(x.ability), ["unknown"])) & BOOST_ANSWERS or x.item not in (0, *IDLE_ITEMS) and \
+            set(ITEMS.get(str(x.item), ["unknown"])) & (BOOST_ANSWERS | {"onUpdate"}):
+        raise Unsupported(f"battler {b}'s ability {x.ability} or item {x.item} answers a stat raise")
+    q = b""
+    for key, n in boosts.items():
+        stat = STATS[key]
+        if n not in RAISE_TEXT or battle.stages[b][stat] + n > 6:
+            raise Unsupported("a stat raise past +6 or of more than 3 stages")
+        battle.stages[b][stat] += n
+        q += queue.encode(0x0C, (b, stat, n)) + queue.encode(0x92, (b, stat, n, 0)) + message(b, RAISE_TEXT[n] + stat, b)
+    return q
+
+
+def status_use(battle, actor, number, position, order):
+    """-> the queue for a stat-stage status move: one zero group, no hit, the hit record with the
+    move's target class, the stat changes."""
+    move = status_move(battle, MOVES[number])
+    if number in UNSEEN_MOVES:
+        raise Unsupported(f"move {number} was never probed")
+    own = move["target"] == "self"
+    target = actor if own else BATTLER_AT[position]
+    if not own and (actor == BOSS) == (target == BOSS):
+        raise Unsupported("a stat move on an ally")
+    if not own and "powder" in move["flags"] and "Grass" in battle.defending(target):
+        raise Unsupported("a powder move on a Grass type")
+    r = battle.rng
+    if type(move["accuracy"]) is int:
+        if battle.stages[actor][6] or battle.stages[target][7]:
+            raise Unsupported("an accuracy or evasion stage")
+        if not r.chance(move["accuracy"]):
+            raise Unsupported("a miss")
+    apos, tpos = POSITION[actor], POSITION[target]
+    q = b""
+    if actor != BOSS:
+        q += queue.encode(0x05, (actor, 0, 2 if not own and battle.b[target].ability == PRESSURE else 1))
+    q += queue.encode(0x07, (actor, 0))
+    q += queue.encode(0xC9, (actor, 0, number, position, 0))
+    q += queue.encode(0x7B, (number, battle.rounds, actor))
+    q += queue.encode_group(0xCF, bytes(20))
+    q += queue.encode(0x7E, (0, 0, 0, 0, 0, 0)) + queue.encode(0x7E, (1, 0, 0, 0, 0, 0))
+    q += queue.encode(0x7E, (2, 7, 7, 7, 7, 7))
+    q += queue.encode(0x8B, (apos, tpos, number, TYPES.index(move["type"]), 0, 0, 0, 0,
+                             7 if own else TARGET_CLASS.get(move["target"], 0), 0))
+    if own:
+        q += raise_stats(battle, actor, move["boosts"])
+    else:
+        q += stat_drop(battle, actor, target, move["boosts"])
+    q += queue.encode(0x7C, ())
+    q += queue.encode(0x08, (actor, 0))
+    q += queue.encode(0x1D, (actor, position, TYPES.index(move["type"]), 1, 0, number, number))
     q += queue.encode(0x5B, (actor, number)) * 2
     q += queue.encode(0x1E, (actor, 0))
     order.append(actor)
