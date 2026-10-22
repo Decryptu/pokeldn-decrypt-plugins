@@ -5,7 +5,8 @@ The callbacks come from the server source data/moves.ts, which the client data s
 import json, os, re, sys
 
 KEEP = ("name", "basePower", "type", "category", "accuracy", "priority", "critRatio", "target", "flags",
-        "secondary", "secondaries", "multihit", "drain", "recoil", "self", "boosts", "status", "volatileStatus")
+        "secondary", "secondaries", "multihit", "drain", "recoil", "self", "boosts", "status", "volatileStatus",
+        "isNonstandard")
 src = json.load(open(sys.argv[1]))
 SERVER = {}
 for body in re.split(r"\n\t[a-z0-9]+: \{(?=\n)", open(sys.argv[2]).read())[1:]:

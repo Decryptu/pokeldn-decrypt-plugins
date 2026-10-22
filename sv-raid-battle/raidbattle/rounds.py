@@ -85,7 +85,7 @@ class Battle:
         self.full = {i: b.stats[0] for i, b in battlers.items()}
         self.triggers = frozenset()                     # boss HP shares its profile acts at
         self.stages = {i: [0] * 8 for i in battlers}     # stat stages by stat index (1 Atk ... 5 Spe, 6 acc, 7 eva)
-        self.field = set()                              # "weather", "terrain": set at the start, never built in rounds
+        self.field = set()                              # "sun", "rain", "snow", "sand", "terrain", set at the start
 
     def defending(self, target):
         return [self.tera] if target == BOSS else self.types[target]
@@ -136,18 +136,20 @@ def message(battler, text, *params):
 def plain(move):
     if move is None or move["category"] == "Status" or not move.get("basePower"):
         raise Unsupported("not a damaging move")
+    if move.get("isNonstandard") in ("Past", "LGPE", "Gmax", "Future"):
+        raise Unsupported(f"{move['name']} is not a Scarlet / Violet move")   # its game data differs
     for key in ("multihit", "recoil", "self", "volatileStatus", "status", "boosts"):
         if key in move:
             raise Unsupported(f"a move with {key}")
     if set(move["callbacks"]) - IDLE_MOVE_CALLBACKS.get(move["name"], set()):
         raise Unsupported(f"{move['name']}'s {move['callbacks'][0]}")
-    if move["target"] != "normal" or move.get("priority", 0):
+    if move["target"] not in ("normal", "any") or move.get("priority", 0):   # "any": one target, any position
         raise Unsupported(f"target {move['target']} or priority")
     if move.get("critRatio", 1) not in CRIT_DRAW:
         raise Unsupported("crit stage")
     for sec in secondaries(move):
-        if set(sec) - {"chance", "status", "volatileStatus"} or "chance" not in sec:
-            raise Unsupported("secondary")                  # a stat drop can draw chance(0) instead
+        if set(sec) - {"chance", "status", "volatileStatus", "boosts"} or "chance" not in sec:
+            raise Unsupported("secondary")
     return move
 
 
@@ -183,11 +185,16 @@ def use(battle, actor, number, position, order):
     knockout = target == BOSS and dmg == battle.hp[target]
     if knockout:
         r.chance(0)                                         # drawn by every hit that knocks the boss out
+    drops = b""
     for sec in secondaries(move):
         if target == BOSS and sec.get("volatileStatus") == "flinch":
             continue                                        # the boss cannot flinch: no draw
+        if sec.get("volatileStatus") == "confusion":
+            r.skip()                                        # one step before the chance (oracle draw replay)
         if r.chance(sec["chance"]):
-            raise Unsupported("a secondary effect")
+            if set(sec) != {"chance", "boosts"} or knockout:
+                raise Unsupported("a secondary effect")
+            drops += stat_drop(battle, actor, target, sec["boosts"])
     if target == BOSS:
         share = lambda hp: hp * 100 / battle.full[BOSS]
         if any(share(battle.hp[BOSS] - dmg) <= t < share(battle.hp[BOSS]) for t in battle.triggers):
@@ -222,7 +229,7 @@ def use(battle, actor, number, position, order):
         q += queue.encode(0xCA, (actor, 574 if weak else 575, END) + (0,) * 7)
     if code > 7:
         q += queue.encode(0x20, (actor, 24))
-    q += queue.encode(0x42, (target, actor, apos, mtype, cat, number, dmg))
+    q += queue.encode(0x42, (target, actor, apos, mtype, cat, number, dmg)) + drops
     if knockout:
         q += boss_down(battle, actor, number)
     if "drain" in move:
@@ -242,6 +249,34 @@ def use(battle, actor, number, position, order):
     q += queue.encode(0x5B, (actor, number)) * 2
     q += queue.encode(0x1E, (actor, 0))
     order.append(actor)
+    return q
+
+
+STATS = {"atk": 1, "def": 2, "spa": 3, "spd": 4, "spe": 5, "accuracy": 6, "evasion": 7}
+BOOST_ANSWERS = {"onTryBoost", "onChangeBoost", "onAfterBoost", "onAfterEachBoost", "onFoeAfterBoost"}
+# Showdown abilities.ts: onTryBoost that blocks only Intimidate, or guards one stat
+INTIMIDATE_ONLY = frozenset({12, 20, 39, 113, 275})        # Oblivious, Own Tempo, Inner Focus, Scrappy, Guard Dog
+STAT_GUARD = {51: 6, 52: 1, 145: 2}                         # Keen Eye, Hyper Cutter, Big Pecks
+
+
+def stat_drop(battle, actor, target, boosts):
+    """A secondary's stat drop on the target: 0x0d and 0x93 (target, stat, stages), then message 31 +
+    stat for one stage, 38 + stat for two, from the attacker."""
+    b = battle.b[target]
+    item = set() if b.item in (0, *IDLE_ITEMS) else set(ITEMS.get(str(b.item), ["unknown"]))
+    ability = set() if b.ability in INTIMIDATE_ONLY | set(STAT_GUARD) else set(ABILITIES.get(str(b.ability), ["unknown"]))
+    if ability & BOOST_ANSWERS or item & (BOOST_ANSWERS | {"onUpdate"}):
+        raise Unsupported(f"battler {target}'s ability {b.ability} or item {b.item} answers a stat drop")
+    q = b""
+    for key, delta in boosts.items():
+        stat, n = STATS[key], -delta
+        if STAT_GUARD.get(b.ability) == stat:
+            raise Unsupported(f"battler {target}'s ability {b.ability} guards stat {stat}")
+        if n not in (1, 2) or battle.stages[target][stat] - n < -6:
+            raise Unsupported("a stat drop past -6 or not 1 or 2 stages")
+        battle.stages[target][stat] -= n
+        q += queue.encode(0x0D, (target, stat, n)) + queue.encode(0x93, (target, stat, n, 0))
+        q += message(actor, (31 if n == 1 else 38) + stat, target, stat)
     return q
 
 
@@ -323,9 +358,8 @@ def callbacks(b, battle=None, acts=()):
 
 def build(battle, slot, command):
     """-> (the round body for `slot`'s command, whether it wins)."""
-    if battle.field:
-        raise Unsupported(f"{sorted(battle.field)[0]} on the field")
     acts = actions(command)
+    weather_check(battle, acts)
     involved = {a[0] for a in acts} | {BATTLER_AT[a[2]] for a in acts if a[2] in BATTLER_AT}
     for b in battle.b.values():
         live = callbacks(b, battle, acts)
@@ -365,6 +399,36 @@ def build(battle, slot, command):
     battle.rounds += 1
     body = action_block(slot, command) + struct.pack("<I", len(q)) + q
     return body + bytes(BODY - len(body)), won
+
+
+# abilities that read the weather (Showdown abilities.ts) -> the weathers they read; Orichalcum Pulse is
+# refused by its own onModifyAtk when it attacks
+WEATHER_ABILITIES = {33: {"rain"}, 44: {"rain"}, 93: {"rain"}, 34: {"sun"}, 94: {"sun"}, 102: {"sun"},
+                     281: {"sun"}, 202: {"snow"}, 81: {"snow"}, 115: {"snow"}, 248: {"snow"},
+                     87: {"sun", "rain"}, 59: {"sun", "rain", "snow"}, 122: {"sun"}, 142: {"sun", "rain", "snow"}}
+WEATHER_TURNS = 5
+
+
+def weather_check(battle, acts):
+    """Sun, rain or snow leave a round unchanged when no move of the round is boosted by it, no battler
+    reads it and it does not end in this round; sand (end-of-round damage) and terrain are refused."""
+    field = battle.field - {"sun", "rain", "snow"}
+    if field:
+        raise Unsupported(f"{sorted(field)[0]} on the field")
+    if not battle.field:
+        return
+    if battle.rounds + 1 >= WEATHER_TURNS:
+        raise Unsupported("the weather ends")
+    if any(WEATHER_ABILITIES.get(b.ability, set()) & battle.field for b in battle.b.values()):
+        raise Unsupported("an ability reads the weather")
+    for actor, number, position in acts:
+        move = MOVES.get(number) or {"type": "", "category": ""}
+        if move["type"] in ("Fire", "Water") and battle.field & {"sun", "rain"}:
+            raise Unsupported("a move the weather changes")
+        target = BATTLER_AT.get(position)
+        if "snow" in battle.field and move["category"] == "Physical" and target and \
+                "Ice" in battle.defending(target):
+            raise Unsupported("an Ice-type target in snow")
 
 
 def handler(battle, act, base, last=True):

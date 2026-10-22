@@ -44,3 +44,8 @@ class Random:
             x = self.next() & 0x7F
             if x < 100:
                 return x < percent
+
+    def skip(self):
+        """One call that steps the state once and returns nothing used."""
+        self.count += 1
+        self.next()

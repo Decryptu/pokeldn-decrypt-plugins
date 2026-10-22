@@ -33,9 +33,9 @@ game's battle server kept in a pokeldn checkout's `scratchpad/battle/oracle` (fo
 |---|---|---|
 | 1 | random numbers, the command queue codec, message headers | done: draws equal the oracle's on 300 seeds; 20 recorded queues round-trip |
 | 2 | the battle start and one plain damaging move on the boss, byte for byte with a recorded round | done |
-| 3 | damage, accuracy, critical hits, the type chart, Tera | built: damage, stat stages, the type chart, STAB, Tera-type boss moves, accuracy draws; refused: critical hits, misses, accuracy or evasion stages |
-| 4 | status moves, stat stages, the common abilities and items | built: 27 switch-in abilities (Intimidate, Download, weather, terrain, stat raises, announcements), abilities whose condition a round's moves do not meet; refused: status moves, weather and terrain in rounds, abilities that act |
+| 3 | damage, accuracy, critical hits, the type chart, Tera | built: damage, stat stages, the type chart, STAB, Tera-type boss moves, accuracy draws, single-target moves at any position, secondary stat drops, the confusion secondary's draws; refused: critical hits, misses, accuracy or evasion stages, moves outside Scarlet / Violet |
+| 4 | status moves, stat stages, the common abilities and items | built: 27 switch-in abilities (Intimidate, Download, weather, terrain, stat raises, announcements), abilities whose condition a round's moves do not meet; rounds under sun, rain or snow that no move or ability reads; refused: status moves, sand, terrain, abilities that act |
 | 5 | fainting, the timer, the boss's actions and shield, the battle's end | built: the boss knocked out wins the battle; refused: a partner knocked out, a boss HP trigger |
 
-Over the 554 oracle battles of corpora `c1`, `d2` and `p1`: start bodies 512 equal, first rounds 95 equal,
-whole battles 29 equal and 67 equal up to a refused round; none different.
+Over the 554 oracle battles of corpora `c1`, `d2` and `p1`: start bodies 512 equal, first rounds 140 equal,
+whole battles 32 equal and 109 equal up to a refused round; none different.

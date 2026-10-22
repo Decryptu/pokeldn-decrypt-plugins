@@ -98,9 +98,13 @@ def syrup(b, battlers, stages):
     return ability_event(b, out) + queue.encode(0x22, (b.id, 8))
 
 
+WEATHER_NAMES = {1: "sun", 2: "rain", 3: "snow", 4: "sand"}
+PROTOSYNTHESIS, QUARK_DRIVE = 281, 282
+
+
 def weather(b, field):
     w, text = WEATHER[b.ability]
-    field.add("weather")
+    field.add(WEATHER_NAMES[w])
     out = queue.encode(0x6A, (0,)) + queue.encode(0x69, (0, w)) + queue.encode(0x79, (w, 5, 0, b.id, 0))
     out += queue.encode(0x88, (w, b.id, 0))
     return ability_event(b, out + (message(b.id, text, b.id) if text else b""))
@@ -200,6 +204,10 @@ def body(battlers, stages=None, battle=None):
     out = b"".join(send_out(battlers[i]) for i in sorted(battlers))
     if sum(b.ability in WEATHER or b.ability in TERRAIN or b.ability in WEATHER_LOCK for b in acting) > 1:
         raise Unsupported("more than one weather or terrain ability")
+    abilities = {b.ability for b in battlers.values()}
+    if PROTOSYNTHESIS in abilities and any(WEATHER.get(b.ability, (0,))[0] == 1 for b in acting) or \
+            QUARK_DRIVE in abilities and any(TERRAIN.get(b.ability, (0,))[0] == 3 for b in acting):
+        raise Unsupported("Protosynthesis or Quark Drive in its weather or terrain")
     unnerving = [b for b in ordered if b.ability == UNNERVE]
     if len(unnerving) > 1:
         raise Unsupported("more than one Unnerve")
