@@ -30,4 +30,20 @@ def test_first_rounds_are_equal_or_refused():
             continue
         assert got == unpack(case["round"], rounds.BODY), case["file"]
         equal += 1
-    assert equal >= 251
+    assert equal >= 256
+
+
+RUNS = json.loads((Path(__file__).parent / "data" / "round_runs.json").read_text())
+
+
+def test_round_runs_in_sand_are_equal():
+    """Battles under a sandstorm, Sand Stream's or Sand Spit's, each round built in order from the
+    console's commands up to the first the plugin refused when the fixture was made."""
+    for case in RUNS:
+        n = case["sizes"]
+        battle = battlers.battle(unpack(case["bootstrap"], n["bootstrap"]), [unpack(p, n["partner"]) for p in case["partners"]])
+        for c, want in zip(case["commands"], case["rounds"]):
+            command = unpack(c, 0x100)
+            got, _ = rounds.build(battle, command[0x19], command)
+            assert got == unpack(want, rounds.BODY), case["file"]
+        assert "sand" in battle.field, case["file"]

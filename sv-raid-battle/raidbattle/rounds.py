@@ -44,6 +44,10 @@ PINCH = {65: "Grass", 66: "Fire", 67: "Water", 68: "Bug"}
 HUGE_POWER, PURE_POWER, ADAPTABILITY = 37, 74, 91
 FOCUS_SASH = 275
 RIVALRY = 79
+SAND_SPIT, SMOOTH_ROCK = 245, 283
+# Showdown: moves whose power, effect or accuracy sandstorm changes
+SAND_MOVES = frozenset({"Weather Ball", "Solar Beam", "Solar Blade", "Shore Up", "Synthesis", "Moonlight",
+                        "Morning Sun"})
 TYPE_BOOSTS = _data("type_boosts.json")
 CONTACT_STATUS = frozenset((9, 38, 49, 56))     # Static, Poison Point, Flame Body, Cute Charm: the target's
 POISON_TOUCH = 143                              # the attacker's
@@ -99,7 +103,9 @@ class Battle:
         self.full = {i: b.stats[0] for i, b in battlers.items()}
         self.triggers = frozenset()                     # boss HP shares its profile acts at
         self.stages = {i: [0] * 8 for i in battlers}     # stat stages by stat index (1 Atk ... 5 Spe, 6 acc, 7 eva)
-        self.field = set()                              # "sun", "rain", "snow", "sand", "terrain", set at the start
+        self.field = set()                              # "sun", "rain", "snow", "sand", "terrain"
+        self.weather_set = 0                            # the round the weather was set in
+        self.sand_hurt = set()                          # battlers the sandstorm has damaged
 
     def slot(self, battler, number):
         """The move's slot in a player's moveset (0x05, 0x07, 0x08); the boss's is 0."""
@@ -143,6 +149,8 @@ class Battle:
         physical = move["category"] == "Physical"
         att = staged(a.stats[1], self.stages[actor][1]) if physical else staged(a.stats[4], self.stages[actor][3])
         dfn = staged(d.stats[2], self.stages[target][2]) if physical else staged(d.stats[5], self.stages[target][4])
+        if not physical and "sand" in self.field and "Rock" in self.defending(target):
+            dfn = modify(dfn, 1.5)                          # Showdown conditions.ts: sandstorm's onModifySpD
         if a.ability in PINCH and move["type"] == PINCH[a.ability] and self.hp[actor] * 3 <= self.full[actor]:
             att = modify(att, 1.5)                          # Showdown: Overgrow, Blaze, Torrent, Swarm
         if a.ability in (HUGE_POWER, PURE_POWER) and physical:
@@ -206,6 +214,8 @@ def use(battle, actor, number, position, order):
         raise Unsupported(f"move {number} was never probed")
     target = BATTLER_AT[position]
     r = battle.rng
+    if "sand" in battle.field and move["name"] in SAND_MOVES:
+        raise Unsupported("a move the weather changes")
     if move["type"] == "Ground" and battle.b[target].ability == LEVITATE:
         raise Unsupported("a Ground move into Levitate")
     if battle.effectiveness(move["type"], target) == 0:
@@ -234,6 +244,8 @@ def use(battle, actor, number, position, order):
     if battle.b[target].ability == SHIELDS_DOWN and 2 * (battle.hp[target] - dmg) <= battle.full[target]:
         raise Unsupported("Shields Down at half HP")
     knockout = target == BOSS and dmg == battle.hp[target]
+    if knockout and BOSS in battle.sand_hurt:
+        raise Unsupported("the boss knocked out after sand damage")     # 0x09's second argument was 1, once
     if knockout:
         r.chance(0)                                         # drawn by every hit that knocks the boss out
     drops = b""
@@ -287,6 +299,10 @@ def use(battle, actor, number, position, order):
     if code > 7:
         q += queue.encode(0x20, (actor, 24))
     q += queue.encode(0x42, (target, actor, apos, mtype, cat, number, dmg))
+    if battle.b[target].ability == SAND_SPIT:
+        if knockout or drops or battle.b[target].item in (AIR_BALLOON, SMOOTH_ROCK) or battle.b[target].ability == RATTLED:
+            raise Unsupported("Sand Spit beside another effect")
+        q += sand_spit(battle, target)
     if battle.b[target].item == AIR_BALLOON and not (target == BOSS and knockout):
         if drops:
             raise Unsupported("an Air Balloon popped with a stat drop")
@@ -322,6 +338,20 @@ def use(battle, actor, number, position, order):
     q += queue.encode(0x1E, (actor, 0))
     order.append(actor)
     return q
+
+
+def sand_spit(battle, b):
+    """Sand Spit (Showdown abilities.ts): hit by a damaging move, it starts a sandstorm for 5 turns, with
+    the start weather's commands and no message."""
+    if battle.field & {"sun", "rain", "snow", "sand"}:
+        raise Unsupported("Sand Spit with a weather up")
+    if any(WEATHER_ABILITIES.get(x.ability, set()) & {"sand"} for x in battle.b.values()):
+        raise Unsupported("an ability reads the weather")
+    battle.field.add("sand")
+    battle.weather_set = battle.rounds
+    q = queue.encode(0x6A, (0,)) + queue.encode(0x69, (0, 4)) + queue.encode(0x79, (4, 5, 0, b, 0))
+    q += queue.encode(0x88, (4, b, 0))
+    return queue.encode(0x25, (b,)) + queue.encode(0xC7, (b, 0)) + q + queue.encode(0xC8, (b,))
 
 
 def recoil(battle, actor, move, dmg, knockout):
@@ -538,7 +568,7 @@ def callbacks(b, battle=None, acts=()):
         live.discard("onModifySTAB")
     if b.ability == RIVALRY:
         live.discard("onBasePower")                     # Battle.damage applies it
-    if b.ability in CONTACT_STATUS or b.ability == RATTLED:
+    if b.ability in CONTACT_STATUS or b.ability in (RATTLED, SAND_SPIT):
         live.discard("onDamagingHit")                   # use() draws it
     if b.ability == POISON_TOUCH:
         live.discard("onSourceDamagingHit")
@@ -607,19 +637,21 @@ def build(battle, slot, command):
 # refused by its own onModifyAtk when it attacks
 WEATHER_ABILITIES = {33: {"rain"}, 44: {"rain"}, 93: {"rain"}, 34: {"sun"}, 94: {"sun"}, 102: {"sun"},
                      281: {"sun"}, 202: {"snow"}, 81: {"snow"}, 115: {"snow"}, 248: {"snow"},
-                     87: {"sun", "rain"}, 59: {"sun", "rain", "snow"}, 122: {"sun"}, 142: {"sun", "rain", "snow"}}
+                     87: {"sun", "rain"}, 59: {"sun", "rain", "snow"}, 122: {"sun"},
+                     142: {"sun", "rain", "snow", "sand"}, 8: {"sand"}, 146: {"sand"}, 159: {"sand"}}
 WEATHER_TURNS = 5
 
 
 def weather_check(battle, acts):
     """Sun, rain or snow leave a round unchanged when no move of the round is boosted by it, no battler
-    reads it and it does not end in this round; sand (end-of-round damage) and terrain are refused."""
-    field = battle.field - {"sun", "rain", "snow"}
+    reads it and it does not end in this round; sand also raises a Rock type's Special Defense
+    (Battle.damage); terrain is refused."""
+    field = battle.field - {"sun", "rain", "snow", "sand"}
     if field:
         raise Unsupported(f"{sorted(field)[0]} on the field")
     if not battle.field:
         return
-    if battle.rounds + 1 >= WEATHER_TURNS:
+    if battle.rounds - battle.weather_set + 1 >= WEATHER_TURNS:
         raise Unsupported("the weather ends")
     if any(WEATHER_ABILITIES.get(b.ability, set()) & battle.field for b in battle.b.values()):
         raise Unsupported("an ability reads the weather")
@@ -647,12 +679,41 @@ def turn_end(battle):
         if b.item == LEFTOVERS and battle.hp[b.id] < battle.full[b.id]:
             raise Unsupported("Leftovers at the turn's end")
         live = callbacks(b) & {"onResidual"}
-        if live or battle.field:
+        if live or battle.field - {"sand"}:
             raise Unsupported(f"battler {b.id}'s residual at the turn's end")
     order = ROUND_END_ORDER(battle)
     q = queue.encode(0xC5, (0,)) + queue.encode(0x50, (0,))
+    if "sand" in battle.field:
+        q += sandstorm(battle, order)
     q += b"".join(queue.encode(0x19, (b, k)) for k in RESIDUALS for b in order if battle.hp[b])
     return q + b"".join(queue.encode(0x44, (k,)) for k in range(1, 14))
+
+
+SAFETY_GOGGLES = 650
+
+
+def sandstorm(battle, order):
+    """Sandstorm's damage at a turn's end (Showdown conditions.ts): a sixteenth of the maximum HP, at
+    least 1, to each battler in speed order that is not Rock, Ground or Steel; message 133, 0xa7, 0x01, 0x9a."""
+    q = b""
+    for i in order:
+        b = battle.b[i]
+        if not battle.hp[i] or set(battle.defending(i)) & {"Rock", "Ground", "Steel"} or b.item == SAFETY_GOGGLES:
+            continue
+        if b.ability in (MAGIC_GUARD, SHIELDS_DOWN) or b.ability in PINCH:
+            raise Unsupported(f"battler {i}'s ability {b.ability} in the sandstorm")
+        dmg = max(1, b.stats[0] // 16)
+        if dmg >= battle.hp[i]:
+            raise Unsupported("a knockout")
+        if i == BOSS:
+            share = lambda hp: hp * 100 // battle.full[BOSS]
+            if any(share(battle.hp[BOSS] - dmg) <= t < share(battle.hp[BOSS]) for t in battle.triggers):
+                raise Unsupported("a boss HP trigger")
+        battle.hp[i] -= dmg
+        battle.sand_hurt.add(i)
+        q += message(i, 133, i) + queue.encode(0xA7, (POSITION[i], 14)) + queue.encode(0x01, (i, 5, dmg, 1))
+        q += queue.encode(0x9A, (i, -dmg & 0xFFFFFFFF))
+    return q
 
 
 def handler(battle, act, base, last=True):
