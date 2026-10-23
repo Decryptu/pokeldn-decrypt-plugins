@@ -43,6 +43,7 @@ ROCK_HEAD, MAGIC_GUARD = 69, 98
 PINCH = {65: "Grass", 66: "Fire", 67: "Water", 68: "Bug"}
 HUGE_POWER, PURE_POWER, ADAPTABILITY = 37, 74, 91
 FOCUS_SASH = 275
+RIVALRY = 79
 TYPE_BOOSTS = _data("type_boosts.json")
 CONTACT_STATUS = frozenset((9, 38, 49, 56))     # Static, Poison Point, Flame Body, Cute Charm: the target's
 POISON_TOUCH = 143                              # the attacker's
@@ -147,8 +148,13 @@ class Battle:
         if a.ability in (HUGE_POWER, PURE_POWER) and physical:
             att = modify(att, 2)
         power = self.power(actor, move)
-        if TYPE_BOOSTS.get(str(a.item)) == move["type"]:
+        boosted = TYPE_BOOSTS.get(str(a.item)) == move["type"]
+        if boosted:
             power = modify(power, 4915 / 4096)              # Showdown items.ts: Charcoal, Spell Tag and kin
+        if a.ability == RIVALRY and a.gender < 2 and d.gender < 2:
+            if boosted:
+                raise Unsupported("Rivalry chained with a type item")
+            power = modify(power, 1.25 if a.gender == d.gender else 0.75)     # Showdown abilities.ts
         base = (2 * a.level // 5 + 2) * power * att // dfn // 50 + 2
         if crit:
             base = modify(base, 1.5)
@@ -530,6 +536,8 @@ def callbacks(b, battle=None, acts=()):
         live -= {"onModifyAtk", "onModifySpA"}             # Battle.damage applies them
     if b.ability == ADAPTABILITY and b.id != BOSS:
         live.discard("onModifySTAB")
+    if b.ability == RIVALRY:
+        live.discard("onBasePower")                     # Battle.damage applies it
     if b.ability in CONTACT_STATUS or b.ability == RATTLED:
         live.discard("onDamagingHit")                   # use() draws it
     if b.ability == POISON_TOUCH:

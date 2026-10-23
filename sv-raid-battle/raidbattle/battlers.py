@@ -27,6 +27,7 @@ class Battler:
     moves: tuple
     base_ability: int = 0   # the ability it was sent out with, when Trace or Imposter replaced it
     transformed: int = 0    # the battler Imposter copied
+    gender: int = 2         # 0 male, 1 female, 2 none
 
     @property
     def speed(self):
@@ -41,7 +42,7 @@ def from_records(bootstrap, partners):
     for battler, slot in SLOT.items():
         f = gen9.read(gen9.decrypt(bytes(records[slot])))
         out[battler] = Battler(battler, f["species"], f["form"], f["level"], f["ability"], f["held_item"],
-                               tuple(f["stats"]), f["current_hp"], tuple(f["moves"]))
+                               tuple(f["stats"]), f["current_hp"], tuple(f["moves"]), gender=f["gender"])
     return out
 
 
