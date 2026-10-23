@@ -25,7 +25,8 @@ class Battler:
     stats: tuple            # HP Atk Def Spe SpA SpD
     hp: int
     moves: tuple
-    base_ability: int = 0   # the ability it was sent out with, when Trace replaced it
+    base_ability: int = 0   # the ability it was sent out with, when Trace or Imposter replaced it
+    transformed: int = 0    # the battler Imposter copied
 
     @property
     def speed(self):

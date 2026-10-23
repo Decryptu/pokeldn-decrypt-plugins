@@ -547,6 +547,8 @@ def callbacks(b, battle=None, acts=()):
 def build(battle, slot, command):
     """-> (the round body for `slot`'s command, whether it wins)."""
     acts = actions(command)
+    if any(b.transformed for b in battle.b.values()):
+        raise Unsupported("a transformed battler")       # its copied stats, moves and types are not built
     weather_check(battle, acts)
     involved = {a[0] for a in acts} | {BATTLER_AT[a[2]] for a in acts if a[2] in BATTLER_AT}
     for b in battle.b.values():

@@ -5,12 +5,17 @@ from raidbattle.battlers import QUIET_ABILITIES
 from raidbattle.server import Unsupported
 
 PRESSURE, OWN_TEMPO, INNER_FOCUS, INTIMIDATE, DEFIANT, FRISK = 46, 20, 39, 22, 128, 119
+CONTRARY, COMPETITIVE, MIRROR_ARMOR, SPA = 126, 172, 240, 3
 UNNERVE, ANTICIPATION = 127, 107
 MESSAGE_UNNERVE, MESSAGE_ANTICIPATION = 679, 145
 BOSS = 2
 ATK = 1
-# a target's answer to Intimidate: Own Tempo blocks it, Defiant raises Attack 2; these are refused
-INTIMIDATE_REFUSED = frozenset({12, 29, 39, 52, 73, 86, 113, 126, 155, 172, 230, 240, 275, 283})
+# a target's answer to Intimidate: Own Tempo and Inner Focus block it, Contrary turns it into a raise,
+# Defiant and Competitive raise a stat 2, Mirror Armor sends it back; these are refused
+INTIMIDATE_REFUSED = frozenset({12, 29, 52, 73, 86, 113, 155, 230, 275, 283})
+INTIMIDATE_ANSWERS = INTIMIDATE_REFUSED | {OWN_TEMPO, INNER_FOCUS, CONTRARY, DEFIANT, COMPETITIVE, MIRROR_ARMOR}
+# a drop that only Intimidate's answers are known for
+SYRUP_REFUSED = INTIMIDATE_ANSWERS
 # switch-in abilities measured on the oracle corpus: ability -> its event
 ANNOUNCED = {104: 147, 164: 167, 163: 168, 213: 446}        # Mold Breaker, Teravolt, Turboblaze, Comatose
 WEATHER_LOCK, MESSAGE_WEATHER_LOCK = frozenset({13, 76}), 590   # Cloud Nine, Air Lock
@@ -24,7 +29,7 @@ TERRAIN = {228: (2, 706, 0xCA), 226: (3, 708, 0xCA), 227: (4, 828, 0xCA), 289: (
 # quiet at switch-in in the oracle corpus, beyond battlers.QUIET_ABILITIES
 QUIET_TOO = frozenset({21, 40, 73, 90, 134, 147, 179, 183, 192, 205, 209, 230, 240, 264, 275, 293, 308})
 AIR_BALLOON = 541
-TRACE = 36
+TRACE, IMPOSTER, MESSAGE_TRANSFORM = 36, 150, 213
 # Showdown abilities.ts, flags failstrace and notrace: never copied
 UNTRACEABLE = frozenset({36, 59, 121, 122, 149, 150, 161, 176, 197, 208, 209, 210, 211, 213, 222, 223, 225, 248, 256,
                          258, 266, 267, 278, 279, 281, 282, 301, 302, 303, 304, 307, 308, 309, 310})
@@ -95,7 +100,7 @@ def syrup(b, battlers, stages):
     """Supersweet Syrup: message 1066, then each foe in id order loses 1 evasion (message 38); 0x22 (b, 8)."""
     out = message(b.id, 1066, b.id)
     for f in foes(b, battlers):
-        if f.ability in INTIMIDATE_REFUSED | {OWN_TEMPO, DEFIANT}:
+        if f.ability in SYRUP_REFUSED:
             raise Unsupported(f"battler {f.id}'s ability {f.ability} answers Supersweet Syrup")
         out += queue.encode(0x0D, (f.id, EVASION, 1)) + queue.encode(0x93, (f.id, EVASION, 1, 0))
         out += message(b.id, 38, f.id, EVASION)
@@ -128,22 +133,39 @@ def foes(b, battlers):
     return [x for i, x in sorted(battlers.items()) if (i == BOSS) != (b.id == BOSS)]
 
 
+def lower_attack(source, target, stages):
+    stages[target.id][ATK] -= 1
+    return queue.encode(0x0D, (target.id, ATK, 1)) + queue.encode(0x93, (target.id, ATK, 1, 0)) + \
+        message(source.id, 32, target.id, ATK)
+
+
+def raise_stat(b, stat, n, text, stages, source=None):
+    stages[b.id][stat] += n
+    return queue.encode(0x0C, (b.id, stat, n)) + queue.encode(0x92, (b.id, stat, n, 0)) + \
+        message((source or b).id, text, b.id)
+
+
 def intimidate(b, battlers, stages):
-    """Intimidate: each foe in id order loses 1 Attack, through 0x0d, 0x93 and message 32."""
+    """Intimidate: each foe in id order loses 1 Attack, through 0x0d, 0x93 and message 32. A foe's
+    answer (Showdown abilities.ts) runs at once, inside the Intimidate event."""
     out = b""
     for f in foes(b, battlers):
         if f.ability in INTIMIDATE_REFUSED:
             raise Unsupported(f"battler {f.id}'s ability {f.ability} answers Intimidate")
-        if f.ability == OWN_TEMPO:
+        if f.ability in (OWN_TEMPO, INNER_FOCUS):
             out += ability_event(f, message(f.id, 69, f.id))
-            continue
-        out += queue.encode(0x0D, (f.id, ATK, 1)) + queue.encode(0x93, (f.id, ATK, 1, 0))
-        out += message(b.id, 32, f.id, ATK)
-        stages[f.id][ATK] -= 1
-        if f.ability == DEFIANT:
-            out += ability_event(f, queue.encode(0x0C, (f.id, ATK, 2)) + queue.encode(0x92, (f.id, ATK, 2, 0))
-                                 + message(f.id, 18, f.id))
-            stages[f.id][ATK] += 2
+        elif f.ability == CONTRARY:
+            out += raise_stat(f, ATK, 1, 11, stages, source=b)
+        elif f.ability == MIRROR_ARMOR:
+            if b.ability != INTIMIDATE or any(x.ability == MIRROR_ARMOR for x in foes(f, battlers)):
+                raise Unsupported(f"battler {f.id}'s Mirror Armor sends Intimidate back")
+            out += ability_event(f, lower_attack(f, b, stages))
+        else:
+            out += lower_attack(b, f, stages)
+            if f.ability == DEFIANT:
+                out += ability_event(f, raise_stat(f, ATK, 2, 18, stages))
+            elif f.ability == COMPETITIVE:
+                out += ability_event(f, raise_stat(f, SPA, 2, 20, stages))
     return out
 
 
@@ -185,12 +207,43 @@ def traced(b):
     return ability_event(b, body, a)
 
 
+def imposter(battlers):
+    """The boss's Imposter transforms it into battler 1, measured on the oracle corpus (9 battles of 9),
+    before the switch-in events; the copied ability then acts as its own."""
+    b, source = battlers[BOSS], battlers[1]
+    if b.ability != IMPOSTER or b.base_ability:
+        return
+    if source.ability in UNTRACEABLE or source.base_ability:
+        raise Unsupported(f"battler {b.id}'s Imposter copies ability {source.ability}")
+    b.base_ability, b.ability, b.transformed = IMPOSTER, source.ability, source.id
+
+
+def transformed(b):
+    """Imposter's event: 0x59 names the copied battler, 0x5e sets its ability, message 213."""
+    body = queue.encode(0x59, (b.id, b.transformed)) + queue.encode(0x5D, (b.id,)) + queue.encode(0x5F, (b.id,))
+    body += queue.encode(0x5E, (b.id, b.ability)) + queue.encode(0xAF, (b.id, b.transformed))
+    return ability_event(b, body + message(b.id, MESSAGE_TRANSFORM, b.id, b.transformed))
+
+
 def switch_in(b, battlers, stages, battle=None):
     out = b""
-    field = battle.field if battle is not None else set()
     if b.base_ability == TRACE:
         out += traced(b)
-    elif b.ability == ANTICIPATION:
+    elif b.base_ability == IMPOSTER:
+        out += transformed(b) + ability_in(b, battlers, stages, battle)
+    else:
+        out += ability_in(b, battlers, stages, battle)
+    if b.item == AIR_BALLOON:
+        out += message(b.id, MESSAGE_AIR_BALLOON, b.id)
+    elif b.item not in QUIET_ITEMS:
+        raise Unsupported(f"battler {b.id}'s item {b.item} is not known at switch-in")
+    return out
+
+
+def ability_in(b, battlers, stages, battle):
+    out = b""
+    field = battle.field if battle is not None else set()
+    if b.ability == ANTICIPATION:
         out += anticipation(b, battlers, battle)
     elif b.ability == UNNERVE:
         pass
@@ -221,10 +274,6 @@ def switch_in(b, battlers, stages, battle=None):
             raise Unsupported(f"battler {b.id}'s Shields Down changes its form")   # Core form: its stats change
     elif b.ability not in QUIET_ABILITIES | QUIET_TOO | {OWN_TEMPO, INNER_FOCUS}:
         raise Unsupported(f"battler {b.id}'s ability {b.ability} acts on switch-in")
-    if b.item == AIR_BALLOON:
-        out += message(b.id, MESSAGE_AIR_BALLOON, b.id)
-    elif b.item not in QUIET_ITEMS:
-        raise Unsupported(f"battler {b.id}'s item {b.item} is not known at switch-in")
     return out
 
 
@@ -233,6 +282,7 @@ def body(battlers, stages=None, battle=None):
     `battle` (rounds.Battle) gives the types Anticipation reads."""
     stages = stages if stages is not None else {i: [0] * 8 for i in battlers}
     trace(battlers, battle)
+    imposter(battlers)
     ordered = sorted(battlers.values(), key=lambda b: -b.speed)
     acting = [b for b in ordered if switch_in(b, battlers, {i: [0] * 8 for i in battlers}, battle)]
     speeds = [b.speed for b in acting]
