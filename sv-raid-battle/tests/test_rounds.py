@@ -30,7 +30,7 @@ def test_first_rounds_are_equal_or_refused():
             continue
         assert got == unpack(case["round"], rounds.BODY), case["file"]
         equal += 1
-    assert equal >= 256
+    assert equal >= 272
 
 
 RUNS = json.loads((Path(__file__).parent / "data" / "round_runs.json").read_text())
@@ -47,3 +47,20 @@ def test_round_runs_in_sand_are_equal():
             got, _ = rounds.build(battle, command[0x19], command)
             assert got == unpack(want, rounds.BODY), case["file"]
         assert "sand" in battle.field, case["file"]
+
+
+TIES = json.loads((Path(__file__).parent / "data" / "tie_runs.json").read_text())
+
+
+def test_round_runs_with_speed_ties_are_equal():
+    """Oracle battles with two battlers at one Speed: the battle start's sort, the action sorts, the
+    round's and the turn's end sorts drawn and ordered as the oracle did, each round built in order up to
+    the first the plugin refused when the fixture was made (pokeldn docs/sv_raid.md, Speed ties)."""
+    for case in TIES:
+        n = case["sizes"]
+        battle = battlers.battle(unpack(case["bootstrap"], n["bootstrap"]), [unpack(p, n["partner"]) for p in case["partners"]])
+        for c, want in zip(case["commands"], case["rounds"]):
+            command = unpack(c, 0x100)
+            got, _ = rounds.build(battle, command[0x19], command)
+            assert got == unpack(want, rounds.BODY), case["file"]
+    assert sum(len(c["rounds"]) for c in TIES) >= 130

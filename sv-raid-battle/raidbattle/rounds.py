@@ -18,6 +18,7 @@ BATTLER_AT = {v: k for k, v in POSITION.items()}
 BLOCK, ACTION, COUNTS, BODY = 0x70, 0x10, 0x230, 0x5060
 END = 0xFFFF0000
 CRIT_DRAW = {1: 24, 2: 8, 3: 2}
+CRIT_GUARD = frozenset((4, 75))                 # Battle Armor, Shell Armor
 _data = lambda name: json.load(open(os.path.join(os.path.dirname(__file__), "data", name)))
 ABILITIES, ITEMS = _data("abilities.json"), _data("items.json")
 # callbacks that cannot fire in a plain round: switching, statuses, boosts, weather, fainting
@@ -102,10 +103,12 @@ class Battle:
         self.hp = {i: b.hp for i, b in battlers.items()}
         self.full = {i: b.stats[0] for i, b in battlers.items()}
         self.triggers = frozenset()                     # boss HP shares its profile acts at
+        self.double = None                              # the double action's HP share (it acts at 0 too)
         self.stages = {i: [0] * 8 for i in battlers}     # stat stages by stat index (1 Atk ... 5 Spe, 6 acc, 7 eva)
         self.field = set()                              # "sun", "rain", "snow", "sand", "terrain"
         self.weather_set = 0                            # the round the weather was set in
         self.sand_hurt = set()                          # battlers the sandstorm has damaged
+        self.switch_order = None                        # the battle start's speed sort (start.body)
 
     def slot(self, battler, number):
         """The move's slot in a player's moveset (0x05, 0x07, 0x08); the boss's is 0."""
@@ -224,7 +227,8 @@ def use(battle, actor, number, position, order):
         raise Unsupported("an accuracy or evasion stage")
     if type(move["accuracy"]) is int and not r.chance(move["accuracy"]):
         raise Unsupported("a miss")
-    crit = r.below(CRIT_DRAW[move.get("critRatio", 1)]) == 0
+    # Battle Armor and Shell Armor (Showdown onCriticalHit false): no critical-hit draw
+    crit = battle.b[target].ability not in CRIT_GUARD and r.below(CRIT_DRAW[move.get("critRatio", 1)]) == 0
     roll = r.below(16)
     if crit:
         raise Unsupported("a critical hit")
@@ -264,8 +268,7 @@ def use(battle, actor, number, position, order):
         if r.chance(30):                                    # Showdown: randomChance(3, 10) on contact, after the secondaries
             raise Unsupported("a contact ability's status")
     if target == BOSS:
-        share = lambda hp: hp * 100 // battle.full[BOSS]     # integer division, as the time triggers
-        if any(share(battle.hp[BOSS] - dmg) <= t < share(battle.hp[BOSS]) for t in battle.triggers):
+        if boss_trigger(battle, dmg):
             raise Unsupported("a boss HP trigger")
     battle.hp[target] -= dmg
     mtype, cat = TYPES.index(move["type"]), 1 if move["category"] == "Physical" else 2
@@ -362,8 +365,7 @@ def recoil(battle, actor, move, dmg, knockout):
     if knockout or r >= battle.hp[actor] or battle.b[actor].ability in (ROCK_HEAD, MAGIC_GUARD):
         raise Unsupported("recoil that faints, after a knockout, or under Rock Head or Magic Guard")
     if actor == BOSS:
-        share = lambda hp: hp * 100 // battle.full[BOSS]
-        if any(share(battle.hp[BOSS] - r) <= t < share(battle.hp[BOSS]) for t in battle.triggers):
+        if boss_trigger(battle, r):
             raise Unsupported("a boss HP trigger")
     battle.hp[actor] -= r
     q = queue.encode(0x01, (actor, actor, r, 4)) + queue.encode(0x9A, (actor, -r & 0xFFFFFFFF))
@@ -595,36 +597,45 @@ def build(battle, slot, command):
             live = {k for k in live if k == "onResidual" or k.startswith("onAny")}
         if live:
             raise Unsupported(f"battler {b.id}'s ability {b.ability} or item {b.item}: {sorted(live)[0]}")
-    speed = lambda a: battle.speed(a[0])
     by_id = sorted(acts, key=lambda a: a[0])
     last = lambda a: battle.b[a[0]].ability == STALL
     priority = lambda a: (MOVES.get(a[1]) or {}).get("priority", 0)
-    ordered = sorted(acts, key=lambda a: (-priority(a), last(a), -speed(a)))
-    if len({(priority(a), speed(a)) for a in acts}) != len(acts):
-        raise Unsupported("a speed tie")
+    key = lambda a: (priority(a), not last(a), battle.speed(a[0]))
+    if len({key(a) for a in acts}) != len(acts) and any(a[1] in HANDLER_MOVES for a in acts):
+        raise Unsupported("a speed tie with a handler move")
+    passed = speed_order(battle, acts, key)                 # three sorts, each of the last one's order
+    ordered = speed_order(battle, speed_order(battle, passed, key), key)
     q = queue.encode(0xB5, (0,))
-    for run, pass_ in ((by_id, 0), (ordered, 1)):
+    for run, pass_ in ((by_id, 0), (passed, 1)):
         q += b"".join(queue.encode(0x51, (a[0], 0 if pass_ and last(a) else 1)) for a in run)
         q += b"".join(handler(battle, a, 0) for a in run)
     q += b"".join(handler(battle, a, 0) for a in ordered) * 2
     order = []
     for i, (actor, number, position) in enumerate(ordered):
         if i:
+            speed_order(battle, ordered, key)                   # re-sorted after each move: only its draws show
             q += b"".join(handler(battle, a, 0) for a in ordered)
         q += handler(battle, (actor, number), 0x72000, last=False)
         q += use(battle, actor, number, position, order)
         if not battle.hp[BOSS]:
             break                                           # the boss is down: nobody else moves
     won = not battle.hp[BOSS]
+    n = (battle.rounds + 1) % TURN
+    # a round ends with three battler sorts, the second the 0x43 order; a turn's end with eight, the
+    # fourth or fifth its residual order (no tie told them apart), the seventh the 0x43 order
+    ends = [speed_order(battle, sorted(battle.b), battle.speed) for _ in range(3 if won or n else 8)]
+    if won and len({battle.speed(b) for b in battle.b}) != len(battle.b):
+        raise Unsupported("a speed tie in the winning round")
     if not won:
         q += queue.encode(0xB2, (0,))
         q += b"".join(queue.encode(0x37, (a, 7, 1)) for a in order)
-        n = (battle.rounds + 1) % TURN
         q += queue.encode(0x75, (3, n))
         if n == 0:
-            q += turn_end(battle)
+            if ends[3] != ends[4] or "sand" in battle.field and len({tuple(e) for e in ends[1:6]}) > 1:
+                raise Unsupported("a speed tie at a turn's end")
+            q += turn_end(battle, ends[3])
         q += queue.encode(0xC5, (1,))
-    q += b"".join(queue.encode(0x43, (b,)) for b in ROUND_END_ORDER(battle) if battle.hp[b])
+    q += b"".join(queue.encode(0x43, (b,)) for b in ends[1 if won or n else 6] if battle.hp[b])
     acted = range(1, 6) if battle.rounds == 0 else sorted(a[0] for a in acts)
     q += b"".join(queue.encode(0x23, (b,)) for b in acted)
     q += queue.encode(0x2D, (0,))
@@ -672,16 +683,15 @@ RESIDUALS = (36, 21, 18, 5, 4, 9, 10, 8, 46, 43, 48, 11, 12, 23, 13, 31, 33, 15,
 LEFTOVERS = 234
 
 
-def turn_end(battle):
+def turn_end(battle, order):
     """A turn's end with nothing to resolve: 0xc5 (0), 0x50 (0), 0x19 (b, kind) for each residual kind
-    over the battlers in speed order, 0x44 (1 to 13)."""
+    over the battlers in `order` (speed order), 0x44 (1 to 13)."""
     for b in battle.b.values():
         if b.item == LEFTOVERS and battle.hp[b.id] < battle.full[b.id]:
             raise Unsupported("Leftovers at the turn's end")
         live = callbacks(b) & {"onResidual"}
         if live or battle.field - {"sand"}:
             raise Unsupported(f"battler {b.id}'s residual at the turn's end")
-    order = ROUND_END_ORDER(battle)
     q = queue.encode(0xC5, (0,)) + queue.encode(0x50, (0,))
     if "sand" in battle.field:
         q += sandstorm(battle, order)
@@ -706,8 +716,7 @@ def sandstorm(battle, order):
         if dmg >= battle.hp[i]:
             raise Unsupported("a knockout")
         if i == BOSS:
-            share = lambda hp: hp * 100 // battle.full[BOSS]
-            if any(share(battle.hp[BOSS] - dmg) <= t < share(battle.hp[BOSS]) for t in battle.triggers):
+            if boss_trigger(battle, dmg):
                 raise Unsupported("a boss HP trigger")
         battle.hp[i] -= dmg
         battle.sand_hurt.add(i)
@@ -725,12 +734,24 @@ def handler(battle, act, base, last=True):
     return q + queue.encode(0x5B, (actor, number)) if last else q
 
 
-def ROUND_END_ORDER(battle):
-    """The battlers in speed order."""
-    speeds = [battle.speed(b) for b in battle.b]
-    if len(set(speeds)) != len(speeds):
-        raise Unsupported("a speed tie at the round's end")
-    return sorted(battle.b, key=lambda b: -battle.speed(b))
+def boss_trigger(battle, loss):
+    """Whether losing `loss` HP takes the boss's HP share (percent, integer division) across a profile
+    trigger; the double action's counts at 0 too while the boss stands (docs/sv_raid.md, The boss's actions)."""
+    hp, share = battle.hp[BOSS], lambda x: x * 100 // battle.full[BOSS]
+    ts = battle.triggers | ({battle.double} if hp - loss > 0 else set())
+    return any(share(hp - loss) <= t < share(hp) for t in ts)
+
+
+def speed_order(battle, items, key):
+    """-> `items` as the game's speed sort leaves them: each against every later one, the later moved ahead
+    when its key is greater; on equal keys below(2), 1 moves it ahead (pokeldn docs/sv_raid.md, Speed ties)."""
+    out = list(items)
+    for i in range(len(out) - 1):
+        for j in range(i + 1, len(out)):
+            a, b = key(out[j]), key(out[i])
+            if a > b or a == b and battle.rng.below(2):
+                out[i], out[j] = out[j], out[i]
+    return out
 
 
 _probe = _data("handler_moves.json")

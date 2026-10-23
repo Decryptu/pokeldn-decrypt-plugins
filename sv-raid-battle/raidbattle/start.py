@@ -183,15 +183,18 @@ def frisk(b, battlers):
 
 def trace(battlers, battle):
     """Trace copies a foe's ability once, before the switch-in events: a player's the boss's, the boss's
-    one of the players picked by below(4) in id order. Only an ability quiet at switch-in is copied."""
+    one of the players it can copy, picked by below(N) in id order (Showdown abilities.ts, trace). Only an
+    ability quiet at switch-in is copied."""
     for b in sorted(battlers.values(), key=lambda b: b.id):
         if b.ability != TRACE or b.base_ability:
             continue
-        players = [battlers[i] for i in sorted(battlers) if i != BOSS]
+        players = [battlers[i] for i in sorted(battlers) if i != BOSS and battlers[i].ability not in UNTRACEABLE]
         if b.id != BOSS:
             source = battlers[BOSS]
         elif battle is None:
             raise Unsupported("the boss's Trace needs the battle's generator")
+        elif not players:
+            continue
         else:
             source = players[battle.rng.below(len(players))]
         if source.ability not in QUIET_ABILITIES | QUIET_TOO | {OWN_TEMPO, INNER_FOCUS} or source.ability in UNTRACEABLE:
@@ -281,13 +284,18 @@ def body(battlers, stages=None, battle=None):
     """-> the 0x11 body for {id: Battler}; `stages` ({id: [0] * 8}) gets the stat stages it sets;
     `battle` (rounds.Battle) gives the types Anticipation reads."""
     stages = stages if stages is not None else {i: [0] * 8 for i in battlers}
+    if battle is not None:                                  # sorted before Trace draws, and once: the body is built twice
+        from raidbattle.rounds import speed_order
+        if battle.switch_order is None:
+            battle.switch_order = speed_order(battle, sorted(battlers), lambda i: battlers[i].speed)
+        ordered = [battlers[i] for i in battle.switch_order]
+    else:
+        ordered = sorted(battlers.values(), key=lambda b: -b.speed)
     trace(battlers, battle)
     imposter(battlers)
-    ordered = sorted(battlers.values(), key=lambda b: -b.speed)
     acting = [b for b in ordered if switch_in(b, battlers, {i: [0] * 8 for i in battlers}, battle)]
-    speeds = [b.speed for b in acting]
-    if len(set(speeds)) != len(speeds):
-        raise Unsupported("a speed tie among switch-in events")
+    if battle is None and len({b.speed for b in acting}) != len(acting):
+        raise Unsupported("a speed tie among switch-in events without the battle's generator")
     out = b"".join(send_out(battlers[i]) for i in sorted(battlers))
     if sum(b.ability in WEATHER or b.ability in TERRAIN or b.ability in WEATHER_LOCK for b in acting) > 1:
         raise Unsupported("more than one weather or terrain ability")

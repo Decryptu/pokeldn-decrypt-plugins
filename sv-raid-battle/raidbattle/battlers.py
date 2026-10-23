@@ -77,6 +77,7 @@ def battle(bootstrap, partners):
     profile = struct.unpack_from("<37I", bootstrap, 5 * PARTY_RECORD + 0x4C)
     battle.hp[rounds.BOSS] = battle.full[rounds.BOSS] = b[rounds.BOSS].stats[0] * profile[0] // 100
     battle.triggers = boss_triggers(profile)
+    battle.double = profile[34]
     start.body(b, battle.stages, battle)
     return battle
 
