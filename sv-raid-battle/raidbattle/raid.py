@@ -24,6 +24,7 @@ class Raid:
         self.late = False               # the time-left action ran: no shield by time, no second one
         self.double = False             # the boss acts twice a round
         self.pending = []               # [(kind, value)] queued and not yet run
+        self.stunned = set()            # client slots whose next boss reply is dropped (the shield broke)
 
     def share(self, battle):
         from raidbattle.battlers import BOSS
@@ -68,6 +69,8 @@ class Raid:
             self.state, self.shield_from = 1, battle.hp[BOSS]
         elif kind == SHIELD_END and self.state == 1:
             self.state = 2
+            if value == 1:
+                self.stunned = {0, 1, 2, 3, 4}  # each player's next turn goes unanswered
         elif kind == LOW_TIME:
             self.late = True
         elif kind == EXTRA:

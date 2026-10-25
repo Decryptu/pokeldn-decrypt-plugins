@@ -78,37 +78,47 @@ def check_rounds(d):
     for t, io, s, h in events:
         if io == "in" and h[:2] == "06":
             commands.setdefault(bytes.fromhex(h)[0x19], []).append(bytes.fromhex(h))
-    sent = [m[0x20:] for m in server_messages(d, 0x15)]
+    sent = [(m[0], m[0x20:]) for m in (bytes.fromhex(e[3]) for e in events if e[1] == "out" and e[2] == 2)
+            if m[0] in (0x15, 0x23)]
     battle = battlers.battle(bytes.fromhex(d["bootstrap"]), [bytes.fromhex(p) for p in d["partners"]])
     start.body(battle.b, None, battle)
-    for n, want in enumerate(sent):
+    rounds_done = 0
+    for n, (kind, want) in enumerate(sent):
         try:
+            if kind == 0x23:
+                got = rounds.revive(battle, next(i for i in range(5) if want[0x230 + i]))
+                if got != want:
+                    a, b = (queue.decode(x[0x23c:0x23c + struct.unpack_from("<I", x, 0x238)[0]]) for x in (got, want))
+                    i = next((i for i in range(min(len(a), len(b))) if a[i] != b[i]), min(len(a), len(b)))
+                    return "different", f"revive after round {rounds_done} command {i}: ours {a[i:i+2]} oracle {b[i:i+2]}"
+                continue
             if want[0x231]:
                 words = raid_words(want)
                 queued = battle.raid.pending
                 if queued and any(k == 1 for k, v in queued):
                     if words != queued:
-                        return "different", f"round {n}: raid actions {words}, queued {queued}"
+                        return "different", f"round {rounds_done}: raid actions {words}, queued {queued}"
                 elif not timed(battle, words):
-                    return "different", f"round {n}: raid actions {words} at no time left"
+                    return "different", f"round {rounds_done}: raid actions {words} at no time left"
                 got, won = rounds.raid_round(battle, words)
             else:
                 if battle.raid.pending and any(k == 1 for k, v in battle.raid.pending):
-                    return "different", f"round {n}: a command round, queued {battle.raid.pending}"
+                    return "different", f"round {rounds_done}: a command round, queued {battle.raid.pending}"
                 command = commands[next(i for i in range(5) if want[0x230 + i])].pop(0)
                 got, won = rounds.build(battle, command[0x19], command)
         except Unsupported as e:
-            if n == 0:
+            if rounds_done == 0:
                 raise
-            return "partial", f"{n} of {len(sent)}; then {e}"
+            return "partial", f"{rounds_done} of {sum(k == 0x15 for k, w in sent)}; then {e}"
         if got != want:
             if got[:0x238] != want[:0x238]:
-                return "different", f"round {n} action block"
+                return "different", f"round {rounds_done} action block"
             m = struct.unpack_from("<I", want, 0x238)[0]
             a, b = queue.decode(got[0x23c:0x23c + struct.unpack_from("<I", got, 0x238)[0]]), queue.decode(want[0x23c:0x23c + m])
             i = next((i for i in range(min(len(a), len(b))) if a[i] != b[i]), min(len(a), len(b)))
-            return "different", f"round {n} command {i}: ours {a[i:i+2]} oracle {b[i:i+2]}"
-    return "equal", f"{len(sent)} rounds"
+            return "different", f"round {rounds_done} command {i}: ours {a[i:i+2]} oracle {b[i:i+2]}"
+        rounds_done += 1
+    return "equal", f"{rounds_done} rounds"
 
 
 def main():

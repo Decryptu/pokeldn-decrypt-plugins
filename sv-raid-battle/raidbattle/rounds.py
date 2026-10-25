@@ -33,7 +33,6 @@ IDLE_ABILITIES = frozenset((0, 3, 29, 33, 34, 44, 53, 77, 81, 84, 137, 141, 158,
 IDLE_ITEMS = frozenset((234, 541))
 # move callbacks that cannot fire in a plain round (Facade: a status the round never sets)
 IDLE_MOVE_CALLBACKS = {"Facade": {"onBasePower"}}
-KNOCKOUTS = False            # set by the spec tools while knockouts are built
 PRESSURE = 46               # a move aimed at it spends 2 PP: 0x05 (b, 0, 2)
 STURDY = 5
 INNER_FOCUS = 39
@@ -119,6 +118,9 @@ class Battle:
         self.turns = 0                                  # rounds a player acted in (0x75)
         self.moved = set()                              # battlers whose move ran this round
         self.raid = None                                # raid.Raid: the boss's actions
+        self.faints = {i: 0 for i in battlers}          # times each battler fainted (the revive's wait)
+        self.timer_offset = 0                           # seconds the faints took off the battle timer
+        self.listed = []                                # battlers revived since the last round (0x23 first)
 
     def slot(self, battler, number):
         """The move's slot in the battler's moveset (0x05, 0x07, 0x08); None for a move it does not know (a
@@ -262,8 +264,6 @@ def use(battle, actor, number, position):
     dmg = battle.damage(actor, target, move, roll, crit)
     if target == BOSS:
         dmg = battle.raid.damage(dmg)
-    if dmg >= battle.hp[target] and target != BOSS and not KNOCKOUTS:
-        raise Unsupported("a knockout")
     if dmg >= battle.hp[target] == battle.full[target] and (battle.b[target].ability == STURDY or
                                                            battle.b[target].item == FOCUS_SASH):
         raise Unsupported("Sturdy or Focus Sash")
@@ -271,16 +271,23 @@ def use(battle, actor, number, position):
     if battle.b[target].ability == SHIELDS_DOWN and 2 * (battle.hp[target] - dmg) <= battle.full[target]:
         raise Unsupported("Shields Down at half HP")
     knockout = target == BOSS and dmg == battle.hp[target]
-    if knockout:
-        r.chance(0)                                         # drawn by every hit that knocks the boss out
+    faint = target != BOSS and dmg == battle.hp[target]
+    if faint and (battle.b[target].item == AIR_BALLOON or battle.b[target].ability in (RATTLED, SAND_SPIT)):
+        raise Unsupported("a knockout beside an item or ability that answers the hit")
+    if knockout or faint:
+        r.chance(0)                                         # drawn by every hit that knocks a battler out
     drops = b""
-    for sec in secondaries(move) if not knockout else ():  # a knocked-out boss draws no secondary
+    for sec in secondaries(move) if not knockout else ():  # a knocked-out boss draws none
         guarded = battle.b[target].ability == INNER_FOCUS and battle.b[actor].ability not in MOLD_BREAKERS
         if sec.get("volatileStatus") == "flinch" and (target == BOSS or guarded):
             continue                                        # the boss, or Inner Focus, cannot flinch: no draw
+        if faint and set(sec) == {"chance", "boosts"}:
+            continue                                        # a stat drop on a fainted player: no draw
+        if faint and "status" in sec:
+            raise Unsupported("a status secondary on a fainted player")
         if sec.get("volatileStatus") == "confusion":
             r.skip()                                        # one step before the chance (oracle draw replay)
-        if r.chance(sec["chance"]):
+        if r.chance(sec["chance"]) and not faint:          # a fainted player draws a flinch or confusion
             if sec.get("volatileStatus") == "flinch" and target in battle.moved and not knockout:
                 continue                                    # a target that already moved: nothing shows
             if set(sec) != {"chance", "boosts"} or knockout:
@@ -322,10 +329,10 @@ def use(battle, actor, number, position):
         weak = code > 7
         q += queue.encode(0x8E, (1, 2 if weak else 3, number))
         q += queue.encode(0xCA, (actor, 574 if weak else 575, END) + (0,) * 7)
-    if crit:
-        q += queue.encode(0xA7, (tpos, 131)) + queue.encode(0x20, (actor, 26))
     if code > 7:
         q += queue.encode(0x20, (actor, 24))
+    if crit:
+        q += queue.encode(0xA7, (tpos, 131)) + queue.encode(0x20, (actor, 26))
     q += queue.encode(0x42, (target, actor, apos, mtype, cat, number, dmg))
     if battle.b[target].ability == SAND_SPIT:
         if knockout or drops or battle.b[target].item in (AIR_BALLOON, SMOOTH_ROCK) or battle.b[target].ability == RATTLED:
@@ -353,9 +360,11 @@ def use(battle, actor, number, position):
             q += queue.encode(0x9A, (actor, heal)) + message(actor, 290, target)
     if knockout:
         q += boss_down(battle, actor, number)
+    elif faint:
+        q += player_down(battle, target, actor, number)
     q += queue.encode(0xD1, bytes([1, 0]))
     if "recoil" in move:
-        q += recoil(battle, actor, move, dmg, knockout)
+        q += recoil(battle, actor, move, dmg, knockout or faint)
     q += queue.encode(0x2E, (2, actor - 1))
     if target == BOSS:
         q += queue.encode(0x85, (7, dmg))
@@ -521,9 +530,47 @@ def boss_down(battle, actor, number):
     q += queue.encode(0x37, (BOSS, 1, 1)) + message(BOSS, 0, BOSS) + queue.encode(0x94, (BOSS, 0))
     q += queue.encode(0x37, (BOSS, 8, 1))
     q += b"".join(queue.encode(c, (BOSS,)) for c in (0x5F, 0x62, 0x6C, 0x5D))
-    q += b"".join(queue.encode(0x41, (b, BOSS)) for b in sorted(battle.b) if b != BOSS)
+    q += b"".join(queue.encode(0x41, (b, BOSS)) for b in sorted(battle.b) if b != BOSS and battle.hp[b])
     q += b"".join(queue.encode(0x33, (BOSS, k)) for k in range(14) if k != 8)
     return q + queue.encode(0x80, (BOSS,)) + queue.encode(0x29, (BOSS,)) + queue.encode(0x38, (actor,))
+
+
+PENALIZED = frozenset((1, 3))       # the host's and the console's Pokemon: a faint costs battle time
+
+
+def player_down(battle, victim, actor, number):
+    """A player's Pokemon knocked out, after the hit's record: as the boss's knockout with the victim's id,
+    0x41 (b, V) for each battler still standing, no 0x80, and for the host's or the console's Pokemon
+    0x81 (-n), n seconds off the battle timer: the time limit times 0.125 times the players' mean level over
+    the boss's (339 of 339 oracle battles; float32, truncated)."""
+    battle.hp[victim] = 0
+    battle.faints[victim] += 1
+    for e in battle.entries:
+        if e.actor == victim:
+            e.done = True                                   # its actions are marked run
+    q = queue.encode(0x49, (victim, actor, number)) + queue.encode(0x09, (actor, battle.slot(actor, number) or 0))
+    q += queue.encode(0x37, (victim, 1, 1)) + message(victim, 0, victim) + queue.encode(0x94, (victim, 0))
+    q += queue.encode(0x37, (victim, 8, 1))
+    q += b"".join(queue.encode(c, (victim,)) for c in (0x5F, 0x62, 0x6C, 0x5D))
+    q += b"".join(queue.encode(0x41, (b, victim)) for b in sorted(battle.b) if battle.hp[b])
+    q += b"".join(queue.encode(0x33, (victim, k)) for k in range(14) if k != 8)
+    q += queue.encode(0x29, (victim,))
+    if victim in PENALIZED:
+        n = faint_penalty(battle)
+        battle.timer_offset -= n
+        q += queue.encode(0x81, (-n & 0xFFFF,))
+    return q + queue.encode(0x38, (actor,))
+
+
+def f32(x):
+    return struct.unpack("<f", struct.pack("<f", x))[0]
+
+
+def faint_penalty(battle):
+    """Seconds a player's faint takes off the battle timer."""
+    players = [battle.b[b].level for b in battle.b if b != BOSS]
+    ratio = f32(f32(f32(sum(players)) / f32(len(players))) / f32(battle.b[BOSS].level))
+    return int(f32(ratio * f32(f32(battle.raid.limit) * f32(0.125))))
 
 
 _never = lambda battle, b, out, inc, every: False
@@ -638,9 +685,11 @@ def run_actions(battle, entries):
     order in the 0x51 pass), then the first action not yet run, again and again, re-sorted after each
     (pokeldn docs/sv_raid.md, Speed ties). After each, the boss's HP triggers (raid_turn)."""
     battle.moved = set()
+    battle.entries = entries
     battle.raid.pending = []
     q = queue.encode(0xB5, (0,))
     q += b"".join(queue.encode(0x51, (b, 1)) for b in sorted({e.actor for e in entries}))
+    q += unanswered(battle, entries)
     q += sort(battle, entries)
     q += b"".join(queue.encode(0x51, (e.actor, int(battle.b[e.actor].ability != STALL)))
                   for e in entries if e.kind == Entry.MOVE)
@@ -650,6 +699,8 @@ def run_actions(battle, entries):
         if e is None:
             break
         e.done = True
+        if not battle.hp[e.actor]:
+            continue                                        # a fainted battler's action does nothing
         q += run(battle, e, entries)
         if not battle.hp[BOSS]:
             break                                           # the boss is down: nobody else moves
@@ -657,6 +708,23 @@ def run_actions(battle, entries):
         if all(e.done for e in entries):
             break
         q += sort(battle, entries)
+    return q
+
+
+def unanswered(battle, entries):
+    """After the shield breaks, the boss's next move against each player's client slot is dropped: its
+    actions are marked run and 0x85 (6, slot) shows it."""
+    from raidbattle.battlers import SLOT
+    q = b""
+    for e in entries:
+        if e.actor == BOSS and e.kind == Entry.MOVE and not e.done:
+            cls = SLOT.get(BATTLER_AT.get(e.position), 0)
+            if cls in battle.raid.stunned:
+                battle.raid.stunned.discard(cls)
+                for x in entries:
+                    if x.actor == BOSS:
+                        x.done = True
+                q += queue.encode(0x85, (6, cls))
     return q
 
 
@@ -749,7 +817,7 @@ def raid_target(battle, number):
 def round_end(battle, entries, acted, won, counted):
     """The round's end: three battler sorts (eight at a turn's end), 0xb2, 0x37 per action, the turn
     counter 0x75 when a player acted, the turn's end every fourth such round, 0xc5, 0x43 in the second
-    sort's order, 0x23 for each battler that acted, 0x2d."""
+    sort's order, 0x23 for each battler revived since the last round then each that acted, 0x2d."""
     n = (battle.turns + 1) % TURN if counted else None
     # a round ends with three battler sorts, the second the 0x43 order; a turn's end with eight, the
     # fourth or fifth its residual order (no tie told them apart), the seventh the 0x43 order
@@ -768,6 +836,8 @@ def round_end(battle, entries, acted, won, counted):
             q += turn_end(battle, ends[3])
         q += queue.encode(0xC5, (1,))
     q += b"".join(queue.encode(0x43, (b,)) for b in ends[1 if won or n != 0 else 6] if battle.hp[b])
+    acted = battle.listed + [b for b in acted if b not in battle.listed]
+    battle.listed = []
     q += b"".join(queue.encode(0x23, (b,)) for b in acted)
     q += queue.encode(0x2D, (0,))
     if counted:
@@ -938,3 +1008,38 @@ def speed_order(battle, items, key):
 
 _probe = _data("handler_moves.json")
 HANDLER_MOVES, UNSEEN_MOVES = frozenset(_probe["handler"]), frozenset(_probe["unseen"])
+
+
+REVIVE_ABILITIES = frozenset((46,))     # Pressure: announced again; other switch-in abilities are refused
+
+
+def revive(battle, slot):
+    """-> the body of message 0x23 for `slot`, whose Pokemon fainted: slot's block holds one action of kind 8;
+    the queue restores its HP (0x03, message 1), sends it back in as at the battle's start with the round
+    count in 0x16, then 0x98 (slot, 0, 0, 1), 0x20 (b, 18) and its switch-in ability."""
+    from raidbattle import start
+    from raidbattle.battlers import SLOT
+    b = next(i for i, s_ in SLOT.items() if s_ == slot)
+    x = battle.b[b]
+    if battle.hp[b]:
+        raise Unsupported(f"battler {b} revived standing")
+    if x.ability not in REVIVE_ABILITIES and x.ability not in start.QUIET_ABILITIES | start.QUIET_TOO:
+        raise Unsupported(f"battler {b}'s ability {x.ability} on its revive")
+    if x.item not in start.QUIET_ITEMS:
+        raise Unsupported(f"battler {b}'s item {x.item} on its revive")
+    battle.hp[b] = battle.full[b]
+    battle.stages[b] = [0] * 8
+    if b not in battle.listed:
+        battle.listed.append(b)
+    pos = slot
+    q = queue.encode(0x03, (b, battle.hp[b])) + message(0, 1, b)
+    q += queue.encode(0x3D, (pos,)) + queue.encode(0x16, (pos, 0, 0, battle.rounds))
+    q += queue.encode(0x5E, (b, x.ability)) + queue.encode(0x61, (b,)) + queue.encode(0x6B, (b,)) + queue.encode(0x4E, (b,))
+    q += queue.encode(0x98, (pos, 0, 0, 1)) + queue.encode(0x20, (b, 18))
+    if x.ability in REVIVE_ABILITIES:
+        q += start.ability_in(x, battle.b, battle.stages, battle)
+    block = bytearray(0x238)
+    struct.pack_into("<Q", block, slot * BLOCK, 8)
+    block[COUNTS + slot] = 1
+    body = bytes(block) + struct.pack("<I", len(q)) + q
+    return body + bytes(BODY - len(body))
