@@ -64,3 +64,23 @@ def test_round_runs_with_speed_ties_are_equal():
             got, _ = rounds.build(battle, command[0x19], command)
             assert got == unpack(want, rounds.BODY), case["file"]
     assert sum(len(c["rounds"]) for c in TIES) >= 130
+
+
+RAIDS = json.loads((Path(__file__).parent / "data" / "raid_runs.json").read_text())
+
+
+def test_round_runs_with_raid_actions_are_equal():
+    """Oracle battles whose rounds hold the boss's raid actions (a raid action round, or a raid action an
+    HP trigger adds inside a round), each round built in order: a command's round from the command, a
+    raid action round from the actions the oracle queued."""
+    for case in RAIDS:
+        n = case["sizes"]
+        battle = battlers.battle(unpack(case["bootstrap"], n["bootstrap"]), [unpack(p, n["partner"]) for p in case["partners"]])
+        for item in case["rounds"]:
+            if "raid" in item:
+                got, _ = rounds.raid_round(battle, [tuple(w) for w in item["raid"]])
+            else:
+                command = unpack(item["command"], 0x100)
+                got, _ = rounds.build(battle, command[0x19], command)
+            assert got == unpack(item["round"], rounds.BODY), case["file"]
+    assert sum(1 for c in RAIDS for r in c["rounds"] if "raid" in r) >= 1

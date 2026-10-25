@@ -52,32 +52,62 @@ def check_round(d):
     return "different", f"command {i}: ours {a[i:i+2]} oracle {b[i:i+2]}"
 
 
+def raid_words(body):
+    """-> [(kind, value)] of a raid action round's block (slot 1)."""
+    out = []
+    for i in range(body[0x231]):
+        w, = struct.unpack_from("<Q", body, 0x70 + 16 * i)
+        out.append(((w >> 4) & 0xFF, w >> 32))
+    return out
+
+
+def timed(battle, words):
+    """Whether the boss's time triggers give `words` at some time left on the battle timer."""
+    r = battle.raid
+    return any(r.triggers(battle, left) == words for left in range(r.limit, -600, -1))
+
+
 def check_rounds(d):
-    """Every round of the battle, built in order from the commands, against the oracle's: the verdict of
-    the first round that is not equal, and how many came before it."""
+    """Every round of the battle, built in order (a command's round from the command, a raid action round
+    from the actions the oracle queued), against the oracle's: the verdict of the first round that is not
+    equal, and how many came before it. A raid action round must be what the plugin queued (a shield by
+    HP) or what its time triggers give at some time left."""
     from raidbattle import rounds
     events = [e for e in d["events"] if e[0] != "draw"]
-    commands = [bytes.fromhex(h) for t, io, s, h in events if io == "in" and h[:2] == "06"]
+    commands = {}
+    for t, io, s, h in events:
+        if io == "in" and h[:2] == "06":
+            commands.setdefault(bytes.fromhex(h)[0x19], []).append(bytes.fromhex(h))
     sent = [m[0x20:] for m in server_messages(d, 0x15)]
-    actions = [i for i, m in enumerate(sent) if m[0x231]]      # the boss's slot: a raid action's round
-    if actions:
-        sent = sent[:actions[0]]
     battle = battlers.battle(bytes.fromhex(d["bootstrap"]), [bytes.fromhex(p) for p in d["partners"]])
     start.body(battle.b, None, battle)
-    for n, (command, want) in enumerate(zip(commands, sent)):
+    for n, want in enumerate(sent):
         try:
-            got, _ = rounds.build(battle, command[0x19], command)
+            if want[0x231]:
+                words = raid_words(want)
+                queued = battle.raid.pending
+                if queued and any(k == 1 for k, v in queued):
+                    if words != queued:
+                        return "different", f"round {n}: raid actions {words}, queued {queued}"
+                elif not timed(battle, words):
+                    return "different", f"round {n}: raid actions {words} at no time left"
+                got, won = rounds.raid_round(battle, words)
+            else:
+                if battle.raid.pending and any(k == 1 for k, v in battle.raid.pending):
+                    return "different", f"round {n}: a command round, queued {battle.raid.pending}"
+                command = commands[next(i for i in range(5) if want[0x230 + i])].pop(0)
+                got, won = rounds.build(battle, command[0x19], command)
         except Unsupported as e:
             if n == 0:
                 raise
             return "partial", f"{n} of {len(sent)}; then {e}"
         if got != want:
+            if got[:0x238] != want[:0x238]:
+                return "different", f"round {n} action block"
             m = struct.unpack_from("<I", want, 0x238)[0]
             a, b = queue.decode(got[0x23c:0x23c + struct.unpack_from("<I", got, 0x238)[0]]), queue.decode(want[0x23c:0x23c + m])
             i = next((i for i in range(min(len(a), len(b))) if a[i] != b[i]), min(len(a), len(b)))
             return "different", f"round {n} command {i}: ours {a[i:i+2]} oracle {b[i:i+2]}"
-    if actions:
-        return "partial", f"{len(sent)} of {len(sent)}; then a raid action"
     return "equal", f"{len(sent)} rounds"
 
 

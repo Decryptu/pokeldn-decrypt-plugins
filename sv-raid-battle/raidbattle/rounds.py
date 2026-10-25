@@ -6,7 +6,7 @@ import json
 import os
 import struct
 
-from raidbattle import queue
+from raidbattle import queue, raid
 from raidbattle.battlers import BOSS
 from raidbattle.server import Unsupported
 
@@ -29,7 +29,7 @@ INERT = {"onStart", "onEnd", "onSwitchIn", "onSwitchOut", "onAnySwitchIn", "onDe
          "onWeather", "onWeatherChange", "onAnySetWeather", "onTerrainChange", "onAllyFaint",
          "onSourceAfterFaint", "onFaint", "onUpdate", "condition"}
 # abilities and items whose callbacks did not fire in any plain first round of the oracle corpus
-IDLE_ABILITIES = frozenset((3, 29, 33, 34, 44, 53, 77, 81, 84, 137, 141, 158, 232, 246, 298, 304))
+IDLE_ABILITIES = frozenset((0, 3, 29, 33, 34, 44, 53, 77, 81, 84, 137, 141, 158, 232, 246, 298, 304))
 IDLE_ITEMS = frozenset((234, 541))
 # move callbacks that cannot fire in a plain round (Facade: a status the round never sets)
 IDLE_MOVE_CALLBACKS = {"Facade": {"onBasePower"}}
@@ -37,6 +37,8 @@ KNOCKOUTS = False            # set by the spec tools while knockouts are built
 PRESSURE = 46               # a move aimed at it spends 2 PP: 0x05 (b, 0, 2)
 STURDY = 5
 INNER_FOCUS = 39
+# Showdown abilities.ts, flag cantsuppress: kept through the players' reset
+CANT_SUPPRESS = frozenset((121, 161, 176, 197, 208, 209, 210, 211, 213, 225, 241, 248, 266, 267, 278, 307))
 AIR_BALLOON = 541
 SHIELDS_DOWN = 197
 LEVITATE = 26
@@ -51,6 +53,8 @@ SAND_MOVES = frozenset({"Weather Ball", "Solar Beam", "Solar Blade", "Shore Up",
                         "Morning Sun"})
 TYPE_BOOSTS = _data("type_boosts.json")
 CONTACT_STATUS = frozenset((9, 38, 49, 56))     # Static, Poison Point, Flame Body, Cute Charm: the target's
+CUTE_CHARM = 56                                 # draws only between a male and a female
+MOLD_BREAKERS = frozenset((104, 163, 164))      # Mold Breaker, Turboblaze, Teravolt: Inner Focus ignored
 POISON_TOUCH = 143                              # the attacker's
 RATTLED = 155                                   # +1 Speed, hit by a Bug, Dark or Ghost move
 STALL = 100                 # moves last in its bracket; 0x51 (b, 0) in the speed pass
@@ -76,6 +80,8 @@ def actions(command):
         word, actor = struct.unpack_from("<QQ", command, 0x28 + 16 * i)
         if word & 0xF != 1:
             raise Unsupported(f"action kind {word & 0xF}")
+        if word >> 25 & 1:
+            raise Unsupported("a Terastallization")      # the shield's Tera percentages and the new types
         out.append((actor & 0xFFFFFFFF, (word >> 8) & 0xFFFF, (word >> 4) & 0xF))
     return out
 
@@ -109,11 +115,15 @@ class Battle:
         self.weather_set = 0                            # the round the weather was set in
         self.sand_hurt = set()                          # battlers the sandstorm has damaged
         self.switch_order = None                        # the battle start's speed sort (start.body)
+        self.turns = 0                                  # rounds a player acted in (0x75)
+        self.moved = set()                              # battlers whose move ran this round
+        self.raid = None                                # raid.Raid: the boss's actions
 
     def slot(self, battler, number):
-        """The move's slot in a player's moveset (0x05, 0x07, 0x08); the boss's is 0."""
+        """The move's slot in the battler's moveset (0x05, 0x07, 0x08); None for a move it does not know (a
+        raid action's move: no 0x07 or 0x08)."""
         moves = self.b[battler].moves
-        return moves.index(number) if battler != BOSS and number in moves else 0
+        return moves.index(number) if number in moves else None if battler == BOSS else 0
 
     def speed(self, battler):
         """The Speed the turn order reads: the stat at its stage."""
@@ -140,12 +150,12 @@ class Battle:
         """The boss is Terastallized: its moves of its Tera type (0x8b's eighth argument)."""
         return actor == BOSS and move["category"] != "Status" and move["type"] == self.tera
 
-    def power(self, actor, move):
-        """Gen 9: a Tera-type move under 60 base power of a Terastallized user hits at 60."""
-        if self.tera_move(actor, move) and move["basePower"] < 60 and move.get("priority", 0) <= 0 \
-                and "multihit" not in move:
+    def power(self, actor, move, power):
+        """Gen 9: a Tera-type move of a Terastallized user hitting under 60 power after its base power
+        modifiers hits at 60 (Showdown sim/battle-actions.ts, getDamage)."""
+        if self.tera_move(actor, move) and power < 60 and move.get("priority", 0) <= 0 and "multihit" not in move:
             return 60
-        return move["basePower"]
+        return power
 
     def damage(self, actor, target, move, roll, crit):
         a, d = self.b[actor], self.b[target]
@@ -158,7 +168,7 @@ class Battle:
             att = modify(att, 1.5)                          # Showdown: Overgrow, Blaze, Torrent, Swarm
         if a.ability in (HUGE_POWER, PURE_POWER) and physical:
             att = modify(att, 2)
-        power = self.power(actor, move)
+        power = move["basePower"]
         boosted = TYPE_BOOSTS.get(str(a.item)) == move["type"]
         if boosted:
             power = modify(power, 4915 / 4096)              # Showdown items.ts: Charcoal, Spell Tag and kin
@@ -166,6 +176,7 @@ class Battle:
             if boosted:
                 raise Unsupported("Rivalry chained with a type item")
             power = modify(power, 1.25 if a.gender == d.gender else 0.75)     # Showdown abilities.ts
+        power = self.power(actor, move, power)
         base = (2 * a.level // 5 + 2) * power * att // dfn // 50 + 2
         if crit:
             base = modify(base, 1.5)
@@ -179,6 +190,13 @@ def message(battler, text, *params):
     """Command 0xcb: battle message `text` about `battler`, its parameters ended by END."""
     args = (battler, text, *params, END)
     return queue.encode(0xCB, args + (0,) * (10 - len(args)))
+
+
+def pp(battle, command, actor, number):
+    """0x07 (before the move) or 0x08 (after it): the actor and the move's slot; none for a move outside
+    the boss's moveset."""
+    slot = battle.slot(actor, number)
+    return b"" if slot is None else queue.encode(command, (actor, slot))
 
 
 def plain(move):
@@ -206,12 +224,12 @@ def secondaries(move):
     return move.get("secondaries") or ([move["secondary"]] if move.get("secondary") else [])
 
 
-def use(battle, actor, number, position, order):
-    """-> the queue for one move use, and the order list gets the actor."""
+def use(battle, actor, number, position):
+    """-> the queue for one move use."""
     if actor != BOSS and (MOVES.get(number) or {}).get("isNonstandard") == "Unobtainable":
         raise Unsupported(f"move {number} is not a player's in Scarlet / Violet")   # the Torques: NPC moves
     if (MOVES.get(number) or {}).get("category") == "Status":
-        return status_use(battle, actor, number, position, order)
+        return status_use(battle, actor, number, position)
     move = plain(MOVES.get(number))
     if number in UNSEEN_MOVES:
         raise Unsupported(f"move {number} was never probed")
@@ -222,7 +240,7 @@ def use(battle, actor, number, position, order):
     if move["type"] == "Ground" and battle.b[target].ability == LEVITATE:
         raise Unsupported("a Ground move into Levitate")
     if battle.effectiveness(move["type"], target) == 0:
-        return immune(battle, actor, target, number, move, position, order)
+        return immune(battle, actor, target, number, move, position)
     if type(move["accuracy"]) is int and (battle.stages[actor][6] or battle.stages[target][7]):
         raise Unsupported("an accuracy or evasion stage")
     if type(move["accuracy"]) is int and not r.chance(move["accuracy"]):
@@ -239,6 +257,8 @@ def use(battle, actor, number, position, order):
         raise Unsupported(f"effectiveness {e}")
     code = EFFECTIVENESS[e]
     dmg = battle.damage(actor, target, move, roll, crit)
+    if target == BOSS:
+        dmg = battle.raid.damage(dmg)
     if dmg >= battle.hp[target] and target != BOSS and not KNOCKOUTS:
         raise Unsupported("a knockout")
     if dmg >= battle.hp[target] == battle.full[target] and (battle.b[target].ability == STURDY or
@@ -248,28 +268,26 @@ def use(battle, actor, number, position, order):
     if battle.b[target].ability == SHIELDS_DOWN and 2 * (battle.hp[target] - dmg) <= battle.full[target]:
         raise Unsupported("Shields Down at half HP")
     knockout = target == BOSS and dmg == battle.hp[target]
-    if knockout and BOSS in battle.sand_hurt:
-        raise Unsupported("the boss knocked out after sand damage")     # 0x09's second argument was 1, once
     if knockout:
         r.chance(0)                                         # drawn by every hit that knocks the boss out
     drops = b""
-    for sec in secondaries(move):
-        if sec.get("volatileStatus") == "flinch" and (target == BOSS or battle.b[target].ability == INNER_FOCUS):
+    for sec in secondaries(move) if not knockout else ():  # a knocked-out boss draws no secondary
+        guarded = battle.b[target].ability == INNER_FOCUS and battle.b[actor].ability not in MOLD_BREAKERS
+        if sec.get("volatileStatus") == "flinch" and (target == BOSS or guarded):
             continue                                        # the boss, or Inner Focus, cannot flinch: no draw
         if sec.get("volatileStatus") == "confusion":
             r.skip()                                        # one step before the chance (oracle draw replay)
         if r.chance(sec["chance"]):
-            if sec.get("volatileStatus") == "flinch" and target in order and not knockout:
+            if sec.get("volatileStatus") == "flinch" and target in battle.moved and not knockout:
                 continue                                    # a target that already moved: nothing shows
             if set(sec) != {"chance", "boosts"} or knockout:
                 raise Unsupported("a secondary effect")
             drops += stat_drop(battle, actor, target, sec["boosts"])
-    if "contact" in move["flags"] and (battle.b[target].ability in CONTACT_STATUS or battle.b[actor].ability == POISON_TOUCH):
+    attract = battle.b[target].ability != CUTE_CHARM or battle.b[actor].gender + battle.b[target].gender == 1
+    if "contact" in move["flags"] and not knockout and (battle.b[target].ability in CONTACT_STATUS and attract or
+                                                        battle.b[actor].ability == POISON_TOUCH):
         if r.chance(30):                                    # Showdown: randomChance(3, 10) on contact, after the secondaries
             raise Unsupported("a contact ability's status")
-    if target == BOSS:
-        if boss_trigger(battle, dmg):
-            raise Unsupported("a boss HP trigger")
     battle.hp[target] -= dmg
     mtype, cat = TYPES.index(move["type"]), 1 if move["category"] == "Physical" else 2
     apos, tpos = POSITION[actor], POSITION[target]
@@ -280,7 +298,7 @@ def use(battle, actor, number, position, order):
     q = b""
     if actor != BOSS:
         q += queue.encode(0x05, (actor, battle.slot(actor, number), 2 if battle.b[target].ability == PRESSURE else 1))
-    q += queue.encode(0x07, (actor, battle.slot(actor, number)))
+    q += pp(battle, 0x07, actor, number)
     q += queue.encode(0xC9, (actor, 0, number, tpos, 0))
     q += queue.encode(0x7B, (number, battle.rounds, actor))
     for size in (20, 5, 5, 5, 19, 20):
@@ -324,7 +342,7 @@ def use(battle, actor, number, position, order):
         heal = int(dmg * n / d + 0.5)                       # the commands carry it uncapped
         if battle.hp[actor] < battle.full[actor] and heal > 0:
             battle.hp[actor] = min(battle.full[actor], battle.hp[actor] + heal)
-            q += queue.encode(0xA7, (target, 51)) + queue.encode(0x03, (actor, heal))
+            q += queue.encode(0xA7, (POSITION[actor], 51)) + queue.encode(0x03, (actor, heal))
             q += queue.encode(0x9A, (actor, heal)) + message(actor, 290, target)
     if knockout:
         q += boss_down(battle, actor, number)
@@ -335,11 +353,10 @@ def use(battle, actor, number, position, order):
     if target == BOSS:
         q += queue.encode(0x85, (7, dmg))
     q += queue.encode(0x7C, ())
-    q += queue.encode(0x08, (actor, battle.slot(actor, number)))
+    q += pp(battle, 0x08, actor, number)
     q += queue.encode(0x1D, (actor, tpos, mtype, 1, 0, number, number))
     q += queue.encode(0x5B, (actor, number)) * 2
     q += queue.encode(0x1E, (actor, 0))
-    order.append(actor)
     return q
 
 
@@ -364,28 +381,24 @@ def recoil(battle, actor, move, dmg, knockout):
     r = max(1, int(dmg * n / d + 0.5))
     if knockout or r >= battle.hp[actor] or battle.b[actor].ability in (ROCK_HEAD, MAGIC_GUARD):
         raise Unsupported("recoil that faints, after a knockout, or under Rock Head or Magic Guard")
-    if actor == BOSS:
-        if boss_trigger(battle, r):
-            raise Unsupported("a boss HP trigger")
     battle.hp[actor] -= r
     q = queue.encode(0x01, (actor, actor, r, 4)) + queue.encode(0x9A, (actor, -r & 0xFFFFFFFF))
     return q + message(actor, 127, actor) + queue.encode(0x37, (actor, 4, r))
 
 
-def immune(battle, actor, target, number, move, position, order):
+def immune(battle, actor, target, number, move, position):
     """A damaging move the target's types are immune to: no draw; five zero groups, message 72."""
     mtype = TYPES.index(move["type"])
     q = b""
     if actor != BOSS:
         q += queue.encode(0x05, (actor, battle.slot(actor, number), 2 if battle.b[target].ability == PRESSURE else 1))
-    q += queue.encode(0x07, (actor, battle.slot(actor, number))) + queue.encode(0xC9, (actor, 0, number, position, 1))
+    q += pp(battle, 0x07, actor, number) + queue.encode(0xC9, (actor, 0, number, position, 1))
     q += queue.encode(0x7B, (number, battle.rounds, actor))
     for size in (20, 5, 5, 5, 19):
         q += queue.encode_group(0xCF, bytes(size))
-    q += message(actor, 72, target) + queue.encode(0x52, (actor, 3)) + queue.encode(0x08, (actor, battle.slot(actor, number)))
+    q += message(actor, 72, target) + queue.encode(0x52, (actor, 3)) + pp(battle, 0x08, actor, number)
     q += queue.encode(0x52, (actor, 0)) + queue.encode(0x1D, (actor, position, mtype, 0, 0, number, number))
     q += queue.encode(0x5B, (actor, number)) * 2 + queue.encode(0x1E, (actor, 0))
-    order.append(actor)
     return q
 
 
@@ -424,7 +437,7 @@ def raise_stats(battle, b, boosts):
     return q
 
 
-def status_use(battle, actor, number, position, order):
+def status_use(battle, actor, number, position):
     """-> the queue for a stat-stage status move: one zero group, no hit, the hit record with the
     move's target class, the stat changes."""
     move = status_move(battle, MOVES[number])
@@ -446,7 +459,7 @@ def status_use(battle, actor, number, position, order):
     q = b""
     if actor != BOSS:
         q += queue.encode(0x05, (actor, battle.slot(actor, number), 2 if not own and battle.b[target].ability == PRESSURE else 1))
-    q += queue.encode(0x07, (actor, battle.slot(actor, number)))
+    q += pp(battle, 0x07, actor, number)
     q += queue.encode(0xC9, (actor, 0, number, position, 0))
     q += queue.encode(0x7B, (number, battle.rounds, actor))
     q += queue.encode_group(0xCF, bytes(20))
@@ -459,11 +472,10 @@ def status_use(battle, actor, number, position, order):
     else:
         q += stat_drop(battle, actor, target, move["boosts"])
     q += queue.encode(0x7C, ())
-    q += queue.encode(0x08, (actor, battle.slot(actor, number)))
+    q += pp(battle, 0x08, actor, number)
     q += queue.encode(0x1D, (actor, position, TYPES.index(move["type"]), 1, 0, number, number))
     q += queue.encode(0x5B, (actor, number)) * 2
     q += queue.encode(0x1E, (actor, 0))
-    order.append(actor)
     return q
 
 
@@ -496,8 +508,9 @@ def stat_drop(battle, actor, target, boosts):
 
 
 def boss_down(battle, actor, number):
-    """The boss knocked out, after the hit's record: the battle is won."""
-    q = queue.encode(0x49, (BOSS, actor, number)) + queue.encode(0x09, (actor, 0))
+    """The boss knocked out, after the hit's record: the battle is won. 0x09 carries the knocking move's
+    slot in its user's moveset (382 of 383 oracle knockouts)."""
+    q = queue.encode(0x49, (BOSS, actor, number)) + queue.encode(0x09, (actor, battle.slot(actor, number) or 0))
     q += queue.encode(0x37, (BOSS, 1, 1)) + message(BOSS, 0, BOSS) + queue.encode(0x94, (BOSS, 0))
     q += queue.encode(0x37, (BOSS, 8, 1))
     q += b"".join(queue.encode(c, (BOSS,)) for c in (0x5F, 0x62, 0x6C, 0x5D))
@@ -536,7 +549,7 @@ WHEN = {
     125: lambda battle, b, out, inc, every: any(secondaries(m) for m in out),
     55: lambda battle, b, out, inc, every: any(m["category"] == "Physical" for m in out),
     91: lambda battle, b, out, inc, every: any(battle.stab(b.id, m["type"]) > 1 for m in out),
-    101: lambda battle, b, out, inc, every: any(battle.power(b.id, m) <= 60 for m in out),
+    101: lambda battle, b, out, inc, every: any(m["basePower"] <= 60 for m in out),
     143: lambda battle, b, out, inc, every: any("contact" in m["flags"] for m in out),
     177: _using("Flying"),
     109: None, 132: None, 140: None,                                # Unaware, Friend Guard, Telepathy: callbacks()
@@ -584,11 +597,185 @@ def callbacks(b, battle=None, acts=()):
     return live
 
 
+class Entry:
+    """A row of the round's action list: a commanded move, a raid action, the stat reset an extra action
+    leaves, or the move an extra action uses (pokeldn docs/sv_raid.md, The boss's actions)."""
+    MOVE, RAID, RESET, RAID_MOVE = "move", "raid", "reset", "raid move"
+
+    def __init__(self, actor, kind, move=0, position=0, sub=0, value=0):
+        self.actor, self.kind, self.move, self.position, self.sub, self.value = actor, kind, move, position, sub, value
+        self.done = False
+
+    def moving(self):
+        return self.kind in (Entry.MOVE, Entry.RAID_MOVE)
+
+
+def order_key(battle, e):
+    """The action's order key: its class (4 a raid action, 2 a reset, 1 a move), the move's priority, not
+    Stall, then Speed (pokeldn docs/sv_raid.md, Speed ties)."""
+    if e.moving():
+        return 1, (MOVES.get(e.move) or {}).get("priority", 0), battle.b[e.actor].ability != STALL, battle.speed(e.actor)
+    return 4 if e.kind == Entry.RAID else 2, 0, True, battle.speed(e.actor)
+
+
+def sort(battle, entries):
+    """One sort of the action list: each move's key computed in list order (a handler move's 0x5a and 0x5b),
+    then the exchange sort with its tie draws."""
+    q = b"".join(handler(battle, (e.actor, e.move), 0) for e in entries if e.moving())
+    entries[:] = speed_order(battle, entries, lambda e: order_key(battle, e))
+    return q
+
+
+def run_actions(battle, entries):
+    """The round's actions in order: the round start's 0x51 by battler id and three sorts (the first's
+    order in the 0x51 pass), then the first action not yet run, again and again, re-sorted after each
+    (pokeldn docs/sv_raid.md, Speed ties). After each, the boss's HP triggers (raid_turn)."""
+    battle.moved = set()
+    battle.raid.pending = []
+    q = queue.encode(0xB5, (0,))
+    q += b"".join(queue.encode(0x51, (b, 1)) for b in sorted({e.actor for e in entries}))
+    q += sort(battle, entries)
+    q += b"".join(queue.encode(0x51, (e.actor, int(battle.b[e.actor].ability != STALL)))
+                  for e in entries if e.kind == Entry.MOVE)
+    q += sort(battle, entries) + sort(battle, entries)
+    while True:
+        e = next((e for e in entries if not e.done), None)
+        if e is None:
+            break
+        e.done = True
+        q += run(battle, e, entries)
+        if not battle.hp[BOSS]:
+            break                                           # the boss is down: nobody else moves
+        raid_turn(battle, entries)
+        if all(e.done for e in entries):
+            break
+        q += sort(battle, entries)
+    return q
+
+
+def run(battle, e, entries):
+    """-> the queue for one action of the list; the round's first move first computes every move's key
+    again (a handler move's 0x5a and 0x5b)."""
+    q = b""
+    if e.moving() and not battle.moved:
+        q += b"".join(handler(battle, (x.actor, x.move), 0) for x in entries if x.moving())
+    if e.moving():
+        battle.moved.add(e.actor)
+    if e.kind == Entry.MOVE:
+        return q + handler(battle, (e.actor, e.move), 0x72000, last=False) + use(battle, e.actor, e.move, e.position)
+    if e.kind == Entry.RAID:
+        return raid_action(battle, e, entries)
+    if e.kind == Entry.RESET:
+        return reset(battle, e.value)
+    target = raid_target(battle, e.move)
+    used = handler(battle, (e.actor, e.move), 0x72000, last=False) + use(battle, e.actor, e.move, target)
+    end = queue.encode(0x1E, (e.actor, 0))
+    return q + queue.encode(0xC1, (9, 0)) + used[:-len(end)] + queue.encode(0xC1, (9, 1)) + end
+
+
+def raid_turn(battle, entries):
+    """After an action, while the boss stands: an empty list of waiting raid actions is filled from the HP
+    triggers; without a shield among them they join this round's actions."""
+    r = battle.raid
+    if r.pending or not battle.hp[BOSS]:
+        return
+    r.pending = r.triggers(battle)
+    if r.pending and all(k != raid.SHIELD for k, v in r.pending):
+        entries += [Entry(BOSS, Entry.RAID, sub=k, value=v) for k, v in r.pending]
+
+
+def raid_action(battle, e, entries):
+    """A raid action: 0x85 (kind, x) and 0xc1 (kind, y), then its effect; an extra action that already ran
+    shows nothing."""
+    r = battle.raid
+    if not r.run(battle, e.sub, e.value):
+        return b""
+    if e.sub == raid.EXTRA:
+        action, _timing, _value, move = r.extras[e.value]
+        q = queue.encode(0x85, (raid.EXTRA, e.value)) + queue.encode(0xC1, (raid.EXTRA, action))
+        if action in (raid.RESET_BOSS, raid.RESET_PLAYERS):
+            entries.append(Entry(BOSS, Entry.RESET, value=action))
+        elif action == raid.MOVE:
+            entries.append(Entry(BOSS, Entry.RAID_MOVE, move=move))
+        else:
+            raise Unsupported(f"raid action {action}")
+        return q
+    if e.sub == raid.DOUBLE:
+        raise Unsupported("the double action")
+    x = 0 if e.sub == raid.LOW_TIME else e.value
+    return queue.encode(0x85, (e.sub, x)) + queue.encode(0xC1, (e.sub, x))
+
+
+def reset(battle, action):
+    """An extra action's reset: the boss's stat changes (0x0f, then 0xc2 (3, 2, 2)), or the standing
+    players' stat changes (0x10 each) and abilities (condition 16 by 0x13 (b, 16, 0, b << 26 | 12, 2) for each
+    whose ability can be suppressed), then 0xc2 (60, 2, 0)."""
+    if action == raid.RESET_BOSS:
+        if any(n > 0 for n in battle.stages[BOSS]):
+            raise Unsupported("the boss's raised stats reset")
+        battle.stages[BOSS] = [0] * 8
+        return queue.encode(0x0F, (BOSS,)) + queue.encode(0xC2, (3, 2, 2))
+    standing = [b for b in sorted(battle.b) if b != BOSS and battle.hp[b]]
+    suppressed = [b for b in standing if battle.b[b].ability not in CANT_SUPPRESS]
+    if any(battle.b[b].suppressed for b in suppressed):
+        raise Unsupported("an ability suppressed twice")
+    for b in standing:
+        battle.stages[b] = [0] * 8
+    for b in suppressed:
+        battle.b[b].suppressed, battle.b[b].ability = battle.b[b].ability, 0
+    q = b"".join(queue.encode(0x10, (b,)) for b in standing)
+    q += b"".join(queue.encode(0x13, (b, 16, 0, b << 26 | 12, 2)) for b in suppressed)
+    return q + queue.encode(0xC2, (60, 2, 0))
+
+
+def raid_target(battle, number):
+    """The position an extra action's move aims at: none (10) for a field move, the boss (4) for its own."""
+    move = MOVES.get(number) or {}
+    target = move.get("target")
+    if target in ("all", "allySide", "foeSide", "allies"):
+        return 10
+    if target in ("self", "adjacentAllyOrSelf"):
+        return POSITION[BOSS]
+    raise Unsupported(f"an extra action's move aimed at a player ({target})")
+
+
+def round_end(battle, entries, acted, won, counted):
+    """The round's end: three battler sorts (eight at a turn's end), 0xb2, 0x37 per action, the turn
+    counter 0x75 when a player acted, the turn's end every fourth such round, 0xc5, 0x43 in the second
+    sort's order, 0x23 for each battler that acted, 0x2d."""
+    n = (battle.turns + 1) % TURN if counted else None
+    # a round ends with three battler sorts, the second the 0x43 order; a turn's end with eight, the
+    # fourth or fifth its residual order (no tie told them apart), the seventh the 0x43 order
+    ends = [speed_order(battle, sorted(battle.b), battle.speed) for _ in range(3 if won or n != 0 else 8)]
+    if won and len({battle.speed(b) for b in battle.b}) != len(battle.b):
+        raise Unsupported("a speed tie in the winning round")
+    q = b""
+    if not won:
+        q += queue.encode(0xB2, (0,))
+        q += b"".join(queue.encode(0x37, (e.actor, 7, 1)) for e in entries)
+        if counted:
+            q += queue.encode(0x75, (3, n))
+        if n == 0:
+            if ends[3] != ends[4] or "sand" in battle.field and len({tuple(e) for e in ends[1:6]}) > 1:
+                raise Unsupported("a speed tie at a turn's end")
+            q += turn_end(battle, ends[3])
+        q += queue.encode(0xC5, (1,))
+    q += b"".join(queue.encode(0x43, (b,)) for b in ends[1 if won or n != 0 else 6] if battle.hp[b])
+    q += b"".join(queue.encode(0x23, (b,)) for b in acted)
+    q += queue.encode(0x2D, (0,))
+    if counted:
+        battle.turns += 1
+    battle.rounds += 1
+    return q
+
+
 def build(battle, slot, command):
     """-> (the round body for `slot`'s command, whether it wins)."""
     acts = actions(command)
     if any(b.transformed for b in battle.b.values()):
         raise Unsupported("a transformed battler")       # its copied stats, moves and types are not built
+    if battle.raid.double:
+        raise Unsupported("the boss acting twice")
     weather_check(battle, acts)
     involved = {a[0] for a in acts} | {BATTLER_AT[a[2]] for a in acts if a[2] in BATTLER_AT}
     for b in battle.b.values():
@@ -597,50 +784,33 @@ def build(battle, slot, command):
             live = {k for k in live if k == "onResidual" or k.startswith("onAny")}
         if live:
             raise Unsupported(f"battler {b.id}'s ability {b.ability} or item {b.item}: {sorted(live)[0]}")
-    by_id = sorted(acts, key=lambda a: a[0])
-    last = lambda a: battle.b[a[0]].ability == STALL
-    priority = lambda a: (MOVES.get(a[1]) or {}).get("priority", 0)
-    key = lambda a: (priority(a), not last(a), battle.speed(a[0]))
+    key = lambda a: ((MOVES.get(a[1]) or {}).get("priority", 0), battle.b[a[0]].ability != STALL, battle.speed(a[0]))
     if len({key(a) for a in acts}) != len(acts) and any(a[1] in HANDLER_MOVES for a in acts):
         raise Unsupported("a speed tie with a handler move")
-    passed = speed_order(battle, acts, key)                 # three sorts, each of the last one's order
-    ordered = speed_order(battle, speed_order(battle, passed, key), key)
-    q = queue.encode(0xB5, (0,))
-    for run, pass_ in ((by_id, 0), (passed, 1)):
-        q += b"".join(queue.encode(0x51, (a[0], 0 if pass_ and last(a) else 1)) for a in run)
-        q += b"".join(handler(battle, a, 0) for a in run)
-    q += b"".join(handler(battle, a, 0) for a in ordered) * 2
-    order = []
-    for i, (actor, number, position) in enumerate(ordered):
-        if i:
-            speed_order(battle, ordered, key)                   # re-sorted after each move: only its draws show
-            q += b"".join(handler(battle, a, 0) for a in ordered)
-        q += handler(battle, (actor, number), 0x72000, last=False)
-        q += use(battle, actor, number, position, order)
-        if not battle.hp[BOSS]:
-            break                                           # the boss is down: nobody else moves
+    entries = [Entry(a, Entry.MOVE, move=n, position=p) for a, n, p in acts]
+    q = run_actions(battle, entries)
     won = not battle.hp[BOSS]
-    n = (battle.rounds + 1) % TURN
-    # a round ends with three battler sorts, the second the 0x43 order; a turn's end with eight, the
-    # fourth or fifth its residual order (no tie told them apart), the seventh the 0x43 order
-    ends = [speed_order(battle, sorted(battle.b), battle.speed) for _ in range(3 if won or n else 8)]
-    if won and len({battle.speed(b) for b in battle.b}) != len(battle.b):
-        raise Unsupported("a speed tie in the winning round")
-    if not won:
-        q += queue.encode(0xB2, (0,))
-        q += b"".join(queue.encode(0x37, (a, 7, 1)) for a in order)
-        q += queue.encode(0x75, (3, n))
-        if n == 0:
-            if ends[3] != ends[4] or "sand" in battle.field and len({tuple(e) for e in ends[1:6]}) > 1:
-                raise Unsupported("a speed tie at a turn's end")
-            q += turn_end(battle, ends[3])
-        q += queue.encode(0xC5, (1,))
-    q += b"".join(queue.encode(0x43, (b,)) for b in ends[1 if won or n else 6] if battle.hp[b])
-    acted = range(1, 6) if battle.rounds == 0 else sorted(a[0] for a in acts)
-    q += b"".join(queue.encode(0x23, (b,)) for b in acted)
-    q += queue.encode(0x2D, (0,))
-    battle.rounds += 1
+    acted = range(1, 6) if battle.rounds == 0 else sorted({a[0] for a in acts})
+    q += round_end(battle, entries, acted, won, True)
     body = action_block(slot, command) + struct.pack("<I", len(q)) + q
+    return body + bytes(BODY - len(body)), won
+
+
+def raid_round(battle, words):
+    """-> (the body of a raid action round for the queued actions `words` [(kind, value)], whether it wins):
+    the actions in slot 1's block (pokeldn docs/sv_raid.md, The boss's actions)."""
+    if battle.raid.double:
+        raise Unsupported("the boss acting twice")
+    entries = [Entry(BOSS, Entry.RAID, sub=k, value=v) for k, v in words]
+    block = bytearray(0x238)
+    for i, (k, v) in enumerate(words):
+        struct.pack_into("<QI", block, BLOCK + ACTION * i, raid.word(k, v), BOSS)
+    block[COUNTS + 1] = len(words)
+    q = run_actions(battle, entries)
+    won = not battle.hp[BOSS]
+    q += round_end(battle, entries, [BOSS], won, False)
+    battle.raid.pending = []
+    body = bytes(block) + struct.pack("<I", len(q)) + q
     return body + bytes(BODY - len(body)), won
 
 
@@ -735,11 +905,12 @@ def handler(battle, act, base, last=True):
 
 
 def boss_trigger(battle, loss):
-    """Whether losing `loss` HP takes the boss's HP share (percent, integer division) across a profile
-    trigger; the double action's counts at 0 too while the boss stands (docs/sv_raid.md, The boss's actions)."""
-    hp, share = battle.hp[BOSS], lambda x: x * 100 // battle.full[BOSS]
-    ts = battle.triggers | ({battle.double} if hp - loss > 0 else set())
-    return any(share(hp - loss) <= t < share(hp) for t in ts)
+    """Whether losing `loss` HP outside an action (the sandstorm) fires one of the boss's HP triggers."""
+    battle.hp[BOSS] -= loss
+    try:
+        return bool(battle.raid.triggers(battle))
+    finally:
+        battle.hp[BOSS] += loss
 
 
 def speed_order(battle, items, key):

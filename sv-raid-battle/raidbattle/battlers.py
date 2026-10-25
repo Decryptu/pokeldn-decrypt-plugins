@@ -28,6 +28,7 @@ class Battler:
     base_ability: int = 0   # the ability it was sent out with, when Trace or Imposter replaced it
     transformed: int = 0    # the battler Imposter copied
     gender: int = 2         # 0 male, 1 female, 2 none
+    suppressed: int = 0     # the ability a raid action suppressed (ability is then 0)
 
     @property
     def speed(self):
@@ -47,6 +48,7 @@ def from_records(bootstrap, partners):
 
 
 TYPE_NONE = 19
+DEFAULT_LIMIT = 300                 # seconds, with raidTimeData inactive (pokeldn docs/sv_raid.md, The battle bootstrap)
 MULTITYPE, RKS_SYSTEM = 121, 225
 
 
@@ -76,18 +78,8 @@ def battle(bootstrap, partners):
     battle = rounds.Battle(b, rng.Random(seed), types, rounds.TYPES[tera])
     profile = struct.unpack_from("<37I", bootstrap, 5 * PARTY_RECORD + 0x4C)
     battle.hp[rounds.BOSS] = battle.full[rounds.BOSS] = b[rounds.BOSS].stats[0] * profile[0] // 100
-    battle.triggers = boss_triggers(profile)
-    battle.double = profile[34]
+    active, game_limit = struct.unpack_from("<2I", bootstrap, 5 * PARTY_RECORD + 0x30)
+    from raidbattle import raid
+    battle.raid = raid.Raid(profile, game_limit if active else DEFAULT_LIMIT)
     start.body(b, battle.stages, battle)
     return battle
-
-
-def boss_triggers(profile):
-    """The boss's HP shares (percent) at which its action profile acts (pokeldn docs/sv_raid.md, The
-    RaidPoint): the shield, each extra action with HP timing (2), the double action."""
-    out = {profile[1], profile[34]}
-    for i in range(6):
-        action, timing, value, _move = profile[10 + 4 * i:14 + 4 * i]
-        if action and timing == 2:
-            out.add(value)
-    return frozenset(out - {0})
