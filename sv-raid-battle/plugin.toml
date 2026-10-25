@@ -1,8 +1,8 @@
 id = "sv-raid-battle"
 name = "Tera Raid battle server"
 description = "Serves a Scarlet / Violet Tera Raid battle from the host, so the console and your Pokemon fight one battle."
-version = "0.4.0"
+version = "0.5.0"
 author = "Decryptu"
 homepage = "https://github.com/Decryptu/pokeldn-decrypt-plugins"
-api = "1.6"
+api = "1.12"
 exclude = ["tests", "tools", "scripts"]

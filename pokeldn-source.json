@@ -6,13 +6,13 @@
     {
       "id": "sv-raid-battle",
       "name": "Tera Raid battle server",
-      "version": "0.4.0",
+      "version": "0.5.0",
       "description": "Serves a Scarlet / Violet Tera Raid battle from the host, so the console and your Pokemon fight one battle.",
       "author": "Decryptu",
-      "api": "1.6",
-      "download": "https://github.com/Decryptu/pokeldn-decrypt-plugins/releases/download/sv-raid-battle-0.4.0/sv-raid-battle-0.4.0.pokeplugin",
-      "sha256": "bf498d2971c1e89c3696feb0b2e44c0d6f70abe400210bb11de0c6707a609568",
-      "size": 56761,
+      "api": "1.12",
+      "download": "https://github.com/Decryptu/pokeldn-decrypt-plugins/releases/download/sv-raid-battle-0.5.0/sv-raid-battle-0.5.0.pokeplugin",
+      "sha256": "7c15abfd0f1288980215a0e1f4727b3384808a03a7f2e56eaa224a06a85fd910",
+      "size": 57713,
       "homepage": "https://github.com/Decryptu/pokeldn-decrypt-plugins"
     }
   ]
