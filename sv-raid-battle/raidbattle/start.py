@@ -270,6 +270,8 @@ def ability_in(b, battlers, stages, battle):
         out += syrup(b, battlers, stages)
     elif b.ability in WEATHER:
         out += weather(b, field)
+        if battle is not None:
+            battle.weather_by = b.id
     elif b.ability in TERRAIN:
         out += terrain(b, field)
     elif b.ability == SHIELDS_DOWN:

@@ -113,6 +113,7 @@ class Battle:
         self.stages = {i: [0] * 8 for i in battlers}     # stat stages by stat index (1 Atk ... 5 Spe, 6 acc, 7 eva)
         self.field = set()                              # "sun", "rain", "snow", "sand", "terrain"
         self.weather_set = 0                            # the round the weather was set in
+        self.weather_by = 0                             # the battler that set it (0x01's second argument)
         self.sand_hurt = set()                          # battlers the sandstorm has damaged
         self.switch_order = None                        # the battle start's speed sort (start.body)
         self.turns = 0                                  # rounds a player acted in (0x75)
@@ -160,8 +161,12 @@ class Battle:
     def damage(self, actor, target, move, roll, crit):
         a, d = self.b[actor], self.b[target]
         physical = move["category"] == "Physical"
-        att = staged(a.stats[1], self.stages[actor][1]) if physical else staged(a.stats[4], self.stages[actor][3])
-        dfn = staged(d.stats[2], self.stages[target][2]) if physical else staged(d.stats[5], self.stages[target][4])
+        # a critical hit ignores the user's lowered and the target's raised stages (Showdown getDamage)
+        ast, dst = self.stages[actor][1 if physical else 3], self.stages[target][2 if physical else 4]
+        if crit:
+            ast, dst = max(ast, 0), min(dst, 0)
+        att = staged(a.stats[1] if physical else a.stats[4], ast)
+        dfn = staged(d.stats[2] if physical else d.stats[5], dst)
         if not physical and "sand" in self.field and "Rock" in self.defending(target):
             dfn = modify(dfn, 1.5)                          # Showdown conditions.ts: sandstorm's onModifySpD
         if a.ability in PINCH and move["type"] == PINCH[a.ability] and self.hp[actor] * 3 <= self.full[actor]:
@@ -248,8 +253,6 @@ def use(battle, actor, number, position):
     # Battle Armor and Shell Armor (Showdown onCriticalHit false): no critical-hit draw
     crit = battle.b[target].ability not in CRIT_GUARD and r.below(CRIT_DRAW[move.get("critRatio", 1)]) == 0
     roll = r.below(16)
-    if crit:
-        raise Unsupported("a critical hit")
     e = battle.effectiveness(move["type"], target)
     if move["type"] == "Ground" and battle.b[target].item == AIR_BALLOON:
         raise Unsupported("a Ground move into an Air Balloon")
@@ -304,10 +307,12 @@ def use(battle, actor, number, position):
     for size in (20, 5, 5, 5, 19, 20):
         q += queue.encode_group(0xCF, bytes(size))
     q += queue.encode(0x7E, (0, *hit))
-    q += queue.encode(0x7E, (1, 0, 0, 0, 0, 0))
+    q += queue.encode(0x7E, (1, *[int(crit) * h for h in hit]))
     q += queue.encode(0x7E, (2, *e5))
     q += queue.encode(0x8B, (apos, tpos, number, mtype, 0, 0, 1, int(battle.tera_move(actor, move)),
                              TARGET_CLASS.get(move["target"], 0), 0))
+    if crit:
+        q += queue.encode(0x37, (actor, 0, 1))
     q += queue.encode(0x37, (target, 2, dmg)) + queue.encode(0x37, (target, 5, 1))
     q += queue.encode(0x02, (target, actor, dmg, 3))
     q += queue.encode(0xD0, bytes([target, code]))
@@ -317,6 +322,8 @@ def use(battle, actor, number, position):
         weak = code > 7
         q += queue.encode(0x8E, (1, 2 if weak else 3, number))
         q += queue.encode(0xCA, (actor, 574 if weak else 575, END) + (0,) * 7)
+    if crit:
+        q += queue.encode(0xA7, (tpos, 131)) + queue.encode(0x20, (actor, 26))
     if code > 7:
         q += queue.encode(0x20, (actor, 24))
     q += queue.encode(0x42, (target, actor, apos, mtype, cat, number, dmg))
@@ -368,7 +375,7 @@ def sand_spit(battle, b):
     if any(WEATHER_ABILITIES.get(x.ability, set()) & {"sand"} for x in battle.b.values()):
         raise Unsupported("an ability reads the weather")
     battle.field.add("sand")
-    battle.weather_set = battle.rounds
+    battle.weather_set, battle.weather_by = battle.rounds, b
     q = queue.encode(0x6A, (0,)) + queue.encode(0x69, (0, 4)) + queue.encode(0x79, (4, 5, 0, b, 0))
     q += queue.encode(0x88, (4, b, 0))
     return queue.encode(0x25, (b,)) + queue.encode(0xC7, (b, 0)) + q + queue.encode(0xC8, (b,))
@@ -851,6 +858,7 @@ TURN = 4                    # a turn ends every fourth command round
 RESIDUALS = (36, 21, 18, 5, 4, 9, 10, 8, 46, 43, 48, 11, 12, 23, 13, 31, 33, 15, 19, 29, 30, 38, 37, 39, 40, 41,
              24, 45, 14, 20, 1, 2, 3, 7, 6, 16, 17, 22, 25, 26, 27, 28, 32, 34, 35)
 LEFTOVERS = 234
+MOODY = 141                 # idle in a round, acts at a turn's end
 
 
 def turn_end(battle, order):
@@ -860,6 +868,8 @@ def turn_end(battle, order):
         if b.item == LEFTOVERS and battle.hp[b.id] < battle.full[b.id]:
             raise Unsupported("Leftovers at the turn's end")
         live = callbacks(b) & {"onResidual"}
+        if b.ability == MOODY and battle.hp[b.id]:
+            raise Unsupported("Moody at the turn's end")
         if live or battle.field - {"sand"}:
             raise Unsupported(f"battler {b.id}'s residual at the turn's end")
     q = queue.encode(0xC5, (0,)) + queue.encode(0x50, (0,))
@@ -874,7 +884,8 @@ SAFETY_GOGGLES = 650
 
 def sandstorm(battle, order):
     """Sandstorm's damage at a turn's end (Showdown conditions.ts): a sixteenth of the maximum HP, at
-    least 1, to each battler in speed order that is not Rock, Ground or Steel; message 133, 0xa7, 0x01, 0x9a."""
+    least 1, to each battler in speed order that is not Rock, Ground or Steel; message 133, 0xa7, 0x01 (b, the
+    battler that raised the sandstorm, damage, 1), 0x9a."""
     q = b""
     for i in order:
         b = battle.b[i]
@@ -890,7 +901,7 @@ def sandstorm(battle, order):
                 raise Unsupported("a boss HP trigger")
         battle.hp[i] -= dmg
         battle.sand_hurt.add(i)
-        q += message(i, 133, i) + queue.encode(0xA7, (POSITION[i], 14)) + queue.encode(0x01, (i, 5, dmg, 1))
+        q += message(i, 133, i) + queue.encode(0xA7, (POSITION[i], 14)) + queue.encode(0x01, (i, battle.weather_by, dmg, 1))
         q += queue.encode(0x9A, (i, -dmg & 0xFFFFFFFF))
     return q
 
