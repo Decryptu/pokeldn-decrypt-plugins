@@ -1946,8 +1946,8 @@ def turn_end(battle, order):
             live = set()                                    # Shed Skin draws below
         if battle.hp[b.id] and battle.status.get(b.id) and battle.status[b.id][0] not in (BRN, PSN, PAR, FRZ, SLP):
             raise Unsupported(f"battler {b.id}'s status at the turn's end")
-        if b.ability == MOODY and battle.hp[b.id]:
-            raise Unsupported("Moody at the turn's end")
+        if b.ability == MOODY and battle.hp[b.id] and any(abs(n) == 6 for n in battle.stages[b.id][1:6]):
+            raise Unsupported("Moody beside a stat at +6 or -6")
         if live:
             raise Unsupported(f"battler {b.id}'s residual at the turn's end: ability {b.ability} item {b.item}")
     q = queue.encode(0xC5, (0,)) + queue.encode(0x50, (0,)) + weather_end(battle)
@@ -1970,6 +1970,17 @@ def turn_end(battle, order):
     q += b"".join(queue.encode(0x44, (k,)) for k in range(9, 14))
     fresh = battle.fresh
     for b in order:
+        if battle.hp[b] and battle.b[b].ability == MOODY:
+            v = battle.rng.below(20)                        # one draw: the raised stat v // 4, the lowered v % 4 of the rest
+            up = (1, 2, 3, 4, 5)[v // 4]
+            down = [x for x in (1, 2, 3, 4, 5) if x != up][v % 4]
+            n = min(2, 6 - battle.stages[b][up])            # +5 rises by 1
+            battle.stages[b][up] += n
+            battle.stages[b][down] -= 1
+            q += queue.encode(0x25, (b,)) + queue.encode(0xC7, (b, 0)) + queue.encode(0x0C, (b, up, n))
+            q += queue.encode(0x92, (b, up, n, 0)) + message(b, RAISE_TEXT[n] + up, b)
+            q += queue.encode(0x0D, (b, down, 1)) + queue.encode(0x93, (b, down, 1, 0)) + message(b, 31 + down, b, down)
+            q += queue.encode(0xC8, (b,))
         if battle.hp[b] and battle.b[b].ability == SPEED_BOOST and b not in fresh:      # Showdown: activeTurns
             if battle.stages[b][5] == 6:
                 raise Unsupported("Speed Boost at +6")
