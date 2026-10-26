@@ -875,7 +875,7 @@ ABSORB = {157: ("Grass", 1), 78: ("Electric", 5)}           # Sap Sipper, Motor 
 
 
 def immune(battle, actor, target, number, move, position, missed=False, floor=False, levitate=False, gone=False,
-           absorb=0):
+           absorb=0, fail=0):
     """A damaging move the target's types are immune to (no draw), or one that missed: five zero groups,
     message 72 and 0x52 (A, 3), or message 73 and 0x52 (A, 1); a stat-dropping move into stats all at -6
     (`floor`, no draw): message 59 + stat per stat, or on its user's stats all at +6, 52 + stat; a Ground move into Levitate (no draw): message 72 about the target
@@ -891,6 +891,8 @@ def immune(battle, actor, target, number, move, position, missed=False, floor=Fa
         q += queue.encode_group(0xCF, bytes(size))
     if gone:
         q += queue.encode(0xCA, (actor, 567, END) + (0,) * 7)
+    elif fail:                                              # a status move that cannot land: its message alone
+        q += message(actor, fail, target)
     elif floor:                                             # 59 + stat "won't go lower", 52 + stat "won't go higher"
         lower = any(d < 0 for d in move["boosts"].values())
         q += b"".join(message(actor, (59 if lower else 52) + STATS[k], target) for k, d in ordered(move["boosts"]))
@@ -1203,10 +1205,15 @@ def status_use(battle, actor, number, position):
         raise Unsupported("a stat move on an ally")
     if move.get("status"):
         cond = STATUS[move["status"]][0]
-        if battle.status.get(target) or STATUS_IMMUNE_TYPES[cond] & set(battle.defending(target)) or \
-                battle.b[target].ability == PURIFYING_SALT or \
+        if STATUS_IMMUNE_TYPES[cond] & set(battle.defending(target)) or \
                 battle.effectiveness(move["type"], target) == 0 and move["name"] == "Thunder Wave":
-            raise Unsupported("a status move that fails")
+            return immune(battle, actor, target, number, move, position, fail=72)
+        if battle.status.get(target):
+            if battle.status[target][0] == cond == PSN:
+                return immune(battle, actor, target, number, move, position, fail=84)    # already poisoned
+            raise Unsupported("a status move on a statused target")
+        if battle.b[target].ability == PURIFYING_SALT:
+            raise Unsupported("a status move into Purifying Salt")
     if not own and ABSORB.get(battle.b[target].ability, ("",))[0] == move["type"]:
         raise Unsupported("a status move into an absorbing ability")
     if not own and "powder" in move["flags"] and "Grass" in battle.defending(target):
