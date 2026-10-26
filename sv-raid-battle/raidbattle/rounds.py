@@ -494,10 +494,21 @@ def immune(battle, actor, target, number, move, position, missed=False):
 RAISE_TEXT, DROP_TEXT = {1: 10, 2: 17, 3: 24}, {1: 31, 2: 38}    # + stat: the stat change's message
 
 
+WEATHER_MOVES = {"Sunny Day": ("sun", 1), "Rain Dance": ("rain", 2), "Snowscape": ("snow", 3), "Sandstorm": ("sand", 4)}
+
+
 def status_move(battle, move):
-    """A status move whose only effect is stat stages, on its user or one target."""
+    """A status move whose only effect is stat stages on its user or one target, a major status on one
+    target, or a weather."""
     if move.get("isNonstandard") in ("Past", "LGPE", "Gmax", "Future"):
         raise Unsupported(f"{move['name']} is not a Scarlet / Violet move")
+    if move["name"] in WEATHER_MOVES and move["callbacks"] == ["weather"]:
+        return move
+    if move.get("status") in STATUS and not any(k in move for k in ("self", "volatileStatus", "boosts",
+                                                                      "secondary", "secondaries")):
+        if set(move["callbacks"]) - {"ignoreImmunity"} or move["target"] != "normal":
+            raise Unsupported(f"{move['name']}'s {(move['callbacks'] or [move['target']])[0]}")
+        return move
     if not move.get("boosts") or any(k in move for k in ("self", "volatileStatus", "status", "secondary",
                                                           "secondaries", "multihit")):
         raise Unsupported("not a damaging move")
@@ -508,6 +519,43 @@ def status_move(battle, move):
     if move["target"] not in ("self", "normal", "any", "allAdjacentFoes"):
         raise Unsupported(f"target {move['target']}")
     return move
+
+
+def weather_start(battle, name, w, b):
+    """A weather raised by battler b: 0x6a (0), 0x69 (0, w), 0x79 (w, 5, 0, b, 0), 0x88 (w, b, 0)."""
+    if battle.field & {"sun", "rain", "snow", "sand"}:
+        raise Unsupported("a weather over another")
+    if any(WEATHER_ABILITIES.get(x.ability, set()) & {name} for x in battle.b.values()):
+        raise Unsupported("an ability reads the weather")
+    if battle.b[b].item in (SMOOTH_ROCK, 284, 285, 259):         # Smooth Rock, Heat Rock, Damp Rock, Icy Rock
+        raise Unsupported("a weather rock")
+    battle.field.add(name)
+    battle.weather_set, battle.weather_by = battle.rounds, b
+    q = queue.encode(0x6A, (0,)) + queue.encode(0x69, (0, w)) + queue.encode(0x79, (w, 5, 0, b, 0))
+    return q + queue.encode(0x88, (w, b, 0))
+
+
+def weather_use(battle, actor, number, position, move):
+    """A weather move: no draw, one zero group, the hit record with the field class (10), the weather."""
+    name, w = WEATHER_MOVES[move["name"]]
+    apos = POSITION[actor]
+    q = b""
+    if actor != BOSS:
+        q += queue.encode(0x05, (actor, battle.slot(actor, number), 1))
+    q += pp(battle, 0x07, actor, number)
+    q += queue.encode(0xC9, (actor, 0, number, position, 0))
+    q += queue.encode(0x7B, (number, battle.rounds, actor))
+    q += queue.encode_group(0xCF, bytes(20))
+    q += queue.encode(0x7E, (0, 0, 0, 0, 0, 0)) + queue.encode(0x7E, (1, 0, 0, 0, 0, 0))
+    q += queue.encode(0x7E, (2, 7, 7, 7, 7, 7))
+    q += queue.encode(0x8B, (apos, position, number, TYPES.index(move["type"]), 0, 0, 0, 0, 10, 0))
+    q += weather_start(battle, name, w, actor)
+    q += queue.encode(0x7C, ())
+    q += pp(battle, 0x08, actor, number)
+    q += queue.encode(0x1D, (actor, position, TYPES.index(move["type"]), 1, 0, number, number))
+    q += queue.encode(0x5B, (actor, number)) * 2
+    q += queue.encode(0x1E, (actor, 0))
+    return q
 
 
 def raise_stats(battle, b, boosts):
@@ -532,10 +580,17 @@ def status_use(battle, actor, number, position):
     move = status_move(battle, MOVES[number])
     if number in UNSEEN_MOVES:
         raise Unsupported(f"move {number} was never probed")
+    if move["name"] in WEATHER_MOVES:
+        return weather_use(battle, actor, number, position, move)
     own = move["target"] == "self"
     target = actor if own else BATTLER_AT[position]
     if not own and (actor == BOSS) == (target == BOSS):
         raise Unsupported("a stat move on an ally")
+    if move.get("status"):
+        cond = STATUS[move["status"]][0]
+        if battle.status.get(target) or STATUS_IMMUNE_TYPES[cond] & set(battle.defending(target)) or \
+                battle.effectiveness(move["type"], target) == 0 and move["name"] == "Thunder Wave":
+            raise Unsupported("a status move that fails")
     if not own and "powder" in move["flags"] and "Grass" in battle.defending(target):
         raise Unsupported("a powder move on a Grass type")
     r = battle.rng
@@ -556,7 +611,10 @@ def status_use(battle, actor, number, position):
     q += queue.encode(0x7E, (2, 7, 7, 7, 7, 7))
     q += queue.encode(0x8B, (apos, tpos, number, TYPES.index(move["type"]), 0, 0, 0, 0,
                              7 if own else TARGET_CLASS.get(move["target"], 0), 0))
-    if own:
+    if move.get("status"):
+        turns = 2 + r.duration(3) if move["status"] == "slp" else 0
+        q += inflict(battle, actor, target, move["status"], turns)
+    elif own:
         q += raise_stats(battle, actor, move["boosts"])
     else:
         q += stat_drop(battle, actor, target, move["boosts"])
