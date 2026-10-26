@@ -125,7 +125,7 @@ class Battle:
         self.double = None                              # the double action's HP share (it acts at 0 too)
         self.stages = {i: [0] * 8 for i in battlers}     # stat stages by stat index (1 Atk ... 5 Spe, 6 acc, 7 eva)
         self.field = set()                              # "sun", "rain", "snow", "sand", "terrain"
-        self.weather_set = 0                            # the round the weather was set in
+        self.weather_left = 0                           # turn ends until the weather ends (0x79's 5)
         self.weather_by = 0                             # the battler that set it (0x01's second argument)
         self.sand_hurt = set()                          # battlers the sandstorm has damaged
         self.switch_order = None                        # the battle start's speed sort (start.body)
@@ -493,7 +493,7 @@ def sand_spit(battle, b):
     if any(WEATHER_ABILITIES.get(x.ability, set()) & {"sand"} for x in battle.b.values()):
         raise Unsupported("an ability reads the weather")
     battle.field.add("sand")
-    battle.weather_set, battle.weather_by = battle.rounds, b
+    battle.weather_left, battle.weather_by = WEATHER_TURNS, b
     q = queue.encode(0x6A, (0,)) + queue.encode(0x69, (0, 4)) + queue.encode(0x79, (4, 5, 0, b, 0))
     q += queue.encode(0x88, (4, b, 0))
     return queue.encode(0x25, (b,)) + queue.encode(0xC7, (b, 0)) + q + queue.encode(0xC8, (b,))
@@ -568,7 +568,7 @@ def weather_start(battle, name, w, b):
     if battle.b[b].item in (SMOOTH_ROCK, 284, 285, 259):         # Smooth Rock, Heat Rock, Damp Rock, Icy Rock
         raise Unsupported("a weather rock")
     battle.field.add(name)
-    battle.weather_set, battle.weather_by = battle.rounds, b
+    battle.weather_left, battle.weather_by = WEATHER_TURNS, b
     q = queue.encode(0x6A, (0,)) + queue.encode(0x69, (0, w)) + queue.encode(0x79, (w, 5, 0, b, 0))
     return q + queue.encode(0x88, (w, b, 0))
 
@@ -1219,15 +1219,12 @@ WEATHER_TURNS = 5
 
 def weather_check(battle, acts):
     """Sun, rain or snow leave a round unchanged when no move of the round is boosted by it, no battler
-    reads it and it does not end in this round; sand also raises a Rock type's Special Defense
-    (Battle.damage); terrain is refused."""
+    reads it; sand also raises a Rock type's Special Defense (Battle.damage); terrain is refused."""
     field = battle.field - {"sun", "rain", "snow", "sand"}
     if field:
         raise Unsupported(f"{sorted(field)[0]} on the field")
     if not battle.field:
         return
-    if battle.rounds - battle.weather_set + 1 >= WEATHER_TURNS:
-        raise Unsupported("the weather ends")
     if any(WEATHER_ABILITIES.get(b.ability, set()) & battle.field for b in battle.b.values()):
         raise Unsupported("an ability reads the weather")
     for actor, number, position in acts:
@@ -1260,9 +1257,9 @@ def turn_end(battle, order):
             raise Unsupported(f"battler {b.id}'s status at the turn's end")
         if b.ability == MOODY and battle.hp[b.id]:
             raise Unsupported("Moody at the turn's end")
-        if live or battle.field - {"sand"}:
+        if live:
             raise Unsupported(f"battler {b.id}'s residual at the turn's end")
-    q = queue.encode(0xC5, (0,)) + queue.encode(0x50, (0,))
+    q = queue.encode(0xC5, (0,)) + queue.encode(0x50, (0,)) + weather_end(battle)
     if "sand" in battle.field:
         q += sandstorm(battle, order)
     for k in RESIDUALS:
@@ -1307,6 +1304,20 @@ def residual(battle, b, kind):
 
 
 SAFETY_GOGGLES = 650
+WEATHER_CODES = {name: w for name, w in WEATHER_MOVES.values()}
+
+
+def weather_end(battle):
+    """A weather's fifth turn end, counting the turn it rose in: 0x99 (w), 0x54, 0x6a (0), before any
+    weather damage, which then does not come."""
+    up = battle.field & set(WEATHER_CODES)
+    if not up:
+        return b""
+    battle.weather_left -= 1
+    if battle.weather_left:
+        return b""
+    battle.field -= up
+    return queue.encode(0x99, (WEATHER_CODES[up.pop()],)) + queue.encode(0x54, ()) + queue.encode(0x6A, (0,))
 
 
 def sandstorm(battle, order):
