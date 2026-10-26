@@ -141,7 +141,8 @@ class Battle:
         self.terrain = None                             # "Grassy", "Misty", "Electric", "Psychic"
         self.terrain_left = 0                           # turn ends until the terrain ends
         self.fresh = set()                              # battlers revived since the last turn end
-        self.charged = set()                            # battlers Wind Power charged (their next Electric move)
+        self.charged = set()
+        self.spent = {}                                 # battler -> PP its current move spent (0x05)                            # battlers Wind Power charged (their next Electric move)
         self.sides = {0: {}, 1: {}}                     # side (0 players, 1 boss) -> {condition: [turns left, setter]}
         self.weather_left = 0                           # turn ends until the weather ends (0x79's 5)
         self.weather_by = 0                             # the battler that set it (0x01's second argument)
@@ -358,8 +359,6 @@ def secondaries(move):
 
 def use(battle, actor, number, position):
     """-> the queue for one move use."""
-    if actor != BOSS and (MOVES.get(number) or {}).get("isNonstandard") == "Unobtainable":
-        raise Unsupported(f"move {number} is not a player's in Scarlet / Violet")   # the Torques: NPC moves
     if (MOVES.get(number) or {}).get("category") == "Status":
         return status_use(battle, actor, number, position)
     move = plain(MOVES.get(number))
@@ -367,6 +366,8 @@ def use(battle, actor, number, position):
         raise Unsupported(f"move {number} was never probed")
     target = BATTLER_AT[position]
     r = battle.rng
+    if not battle.hp[target]:
+        return immune(battle, actor, target, number, move, position, gone=True)
     if actor in battle.charged and move["type"] == "Electric":
         raise Unsupported("a charged battler's Electric move")
     if "sand" in battle.field and move["name"] in SAND_MOVES:
@@ -397,7 +398,7 @@ def use(battle, actor, number, position):
     apos, tpos = POSITION[actor], POSITION[target]
     q = b""
     if actor != BOSS:
-        q += queue.encode(0x05, (actor, battle.slot(actor, number), 2 if battle.b[target].ability == PRESSURE else 1))
+        q += queue.encode(0x05, (actor, battle.slot(actor, number), battle.spent.get(actor, 1)))
     q += pp(battle, 0x07, actor, number)
     q += queue.encode(0xC9, (actor, 0, number, tpos, 0))
     q += queue.encode(0x7B, (number, battle.rounds, actor))
@@ -618,20 +619,23 @@ def recoil(battle, actor, move, dmg, knockout):
     return q + message(actor, 127, actor) + queue.encode(0x37, (actor, 4, r))
 
 
-def immune(battle, actor, target, number, move, position, missed=False, floor=False, levitate=False):
+def immune(battle, actor, target, number, move, position, missed=False, floor=False, levitate=False, gone=False):
     """A damaging move the target's types are immune to (no draw), or one that missed: five zero groups,
     message 72 and 0x52 (A, 3), or message 73 and 0x52 (A, 1); a stat-dropping move into stats all at -6
     (`floor`, no draw): message 60 alone; a Ground move into Levitate (no draw): message 72 about the target
-    inside its ability's activation, 0x25 (T), 0xc7 (T, 0) ... 0xc8 (T)."""
+    inside its ability's activation, 0x25 (T), 0xc7 (T, 0) ... 0xc8 (T); a target fainted since the move was
+    aimed (`gone`): 0xca (A, 567) and no 0x08."""
     mtype = TYPES.index(move["type"])
     q = b""
     if actor != BOSS:
-        q += queue.encode(0x05, (actor, battle.slot(actor, number), 2 if battle.b[target].ability == PRESSURE else 1))
+        q += queue.encode(0x05, (actor, battle.slot(actor, number), battle.spent.get(actor, 1)))
     q += pp(battle, 0x07, actor, number) + queue.encode(0xC9, (actor, 0, number, position, 1))
     q += queue.encode(0x7B, (number, battle.rounds, actor))
     for size in (20, 5, 5, 5, 19):
         q += queue.encode_group(0xCF, bytes(size))
-    if floor:
+    if gone:
+        q += queue.encode(0xCA, (actor, 567, END) + (0,) * 7)
+    elif floor:
         q += message(actor, 60, target)
     elif levitate:
         q += queue.encode(0x25, (target,)) + queue.encode(0xC7, (target, 0)) + message(target, 72, target)
@@ -785,7 +789,7 @@ def weather_use(battle, actor, number, position, move):
     apos = POSITION[actor]
     q = b""
     if actor != BOSS:
-        q += queue.encode(0x05, (actor, battle.slot(actor, number), 1))
+        q += queue.encode(0x05, (actor, battle.slot(actor, number), battle.spent.get(actor, 1)))
     q += pp(battle, 0x07, actor, number)
     q += queue.encode(0xC9, (actor, 0, number, position, 0))
     q += queue.encode(0x7B, (number, battle.rounds, actor))
@@ -829,7 +833,7 @@ def shielded(battle, actor, number, position, move):
     the corpora): 0xc9 (A, 0, M, P, 1), 0xca (A, 567, A), 0x52 (A, 0), 0x1d with no hit, 0x5b twice, 0x1e."""
     q = b""
     if actor != BOSS:
-        q += queue.encode(0x05, (actor, battle.slot(actor, number), 2 if battle.b[BOSS].ability == PRESSURE else 1))
+        q += queue.encode(0x05, (actor, battle.slot(actor, number), battle.spent.get(actor, 1)))
     q += pp(battle, 0x07, actor, number) + queue.encode(0xC9, (actor, 0, number, position, 1))
     q += queue.encode(0xCA, (actor, 567, actor, END) + (0,) * 6) + queue.encode(0x52, (actor, 0))
     q += queue.encode(0x1D, (actor, position, TYPES.index(move["type"]), 0, 0, number, number))
@@ -873,7 +877,7 @@ def status_use(battle, actor, number, position):
     apos, tpos = POSITION[actor], POSITION[target]
     q = b""
     if actor != BOSS:
-        q += queue.encode(0x05, (actor, battle.slot(actor, number), 2 if not own and battle.b[target].ability == PRESSURE else 1))
+        q += queue.encode(0x05, (actor, battle.slot(actor, number), battle.spent.get(actor, 1)))
     q += pp(battle, 0x07, actor, number)
     q += queue.encode(0xC9, (actor, 0, number, position, 0))
     q += queue.encode(0x7B, (number, battle.rounds, actor))
@@ -971,13 +975,17 @@ def no_pp(battle, e):
     """Whether a player's move has no PP left (it fails with message 578); else its PP are spent: 2 against
     a target with Pressure."""
     b = battle.b[e.actor]
+    battle.spent.pop(e.actor, None)
     if e.move not in b.moves:
         return False
     i = b.moves.index(e.move)
     if not b.pp[i]:
         return True
     target = BATTLER_AT.get(e.position)
-    b.pp[i] = max(0, b.pp[i] - (2 if target and battle.b[target].ability == PRESSURE else 1))
+    own = (MOVES.get(e.move) or {}).get("target") in ("self", "allySide", "all")
+    cost = 2 if target and not own and battle.b[target].ability == PRESSURE else 1
+    battle.spent[e.actor] = min(cost, b.pp[i])             # 0x05 shows what was spent: 1 from a last PP
+    b.pp[i] -= battle.spent[e.actor]
     return False
 
 
