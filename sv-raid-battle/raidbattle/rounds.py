@@ -29,7 +29,7 @@ INERT = {"onStart", "onEnd", "onSwitchIn", "onSwitchOut", "onAnySwitchIn", "onDe
          "onWeather", "onWeatherChange", "onAnySetWeather", "onTerrainChange", "onAllyFaint",
          "onSourceAfterFaint", "onFaint", "onUpdate", "condition"}
 # abilities and items whose callbacks did not fire in any plain first round of the oracle corpus
-IDLE_ABILITIES = frozenset((0, 3, 29, 33, 34, 44, 53, 77, 81, 84, 137, 141, 158, 232, 246, 298, 304))
+IDLE_ABILITIES = frozenset((0, 3, 29, 33, 34, 44, 53, 77, 81, 84, 137, 141, 232, 246, 304))
 IDLE_ITEMS = frozenset((234, 541))
 # move callbacks that cannot fire in a plain round (Facade: a status the round never sets)
 IDLE_MOVE_CALLBACKS = {"Facade": {"onBasePower"}}
@@ -57,6 +57,7 @@ MOLD_BREAKERS = frozenset((104, 163, 164))      # Mold Breaker, Turboblaze, Tera
 POISON_TOUCH = 143                              # the attacker's
 RATTLED = 155                                   # +1 Speed, hit by a Bug, Dark or Ghost move
 STALL = 100                 # moves last in its bracket; 0x51 (b, 0) in the speed pass
+PRANKSTER, MYCELIUM_MIGHT = 158, 298
 TARGET_CLASS = {"allAdjacent": 4, "allAdjacentFoes": 5}
 # major statuses: condition id, 0xa7 code and the infliction's message (pokeldn docs/sv_raid.md, Statuses)
 PAR, SLP, FRZ, BRN, PSN = 1, 2, 3, 4, 5
@@ -630,6 +631,8 @@ def status_use(battle, actor, number, position):
             raise Unsupported("a status move that fails")
     if not own and "powder" in move["flags"] and "Grass" in battle.defending(target):
         raise Unsupported("a powder move on a Grass type")
+    if not own and battle.b[actor].ability == PRANKSTER and "Dark" in battle.defending(target):
+        raise Unsupported("Prankster's move on a Dark type")
     r = battle.rng
     if type(move["accuracy"]) is int:
         if battle.stages[actor][6] or battle.stages[target][7]:
@@ -875,8 +878,10 @@ def callbacks(b, battle=None, acts=()):
             live = live if any((i == BOSS) == (b.id == BOSS) for i in hit) else set()
         elif not WHEN[b.ability](battle, b, out, inc, [move(n) for a, n, p in acts]):
             live = set()
-    if b.ability == STALL:
-        live.discard("onFractionalPriority")
+    if b.ability in (STALL, MYCELIUM_MIGHT):
+        live.discard("onFractionalPriority")            # order_key and the 0x51 pass apply them
+    if b.ability == PRANKSTER:
+        live.discard("onModifyPriority")
     if b.ability in PINCH or b.ability in (HUGE_POWER, PURE_POWER):
         live -= {"onModifyAtk", "onModifySpA"}             # Battle.damage applies them
     if b.ability == ADAPTABILITY and b.id != BOSS:
@@ -931,8 +936,22 @@ def order_key(battle, e):
     battler's 0x51 value this round (0 for Stall; 1 in the round's first sort, before the 0x51 pass sets it),
     then Speed (pokeldn docs/sv_raid.md, Speed ties)."""
     if e.moving():
-        return 1, (MOVES.get(e.move) or {}).get("priority", 0), battle.paced.get(e.actor, 1), battle.speed(e.actor)
+        return 1, priority(battle, e.actor, e.move), battle.paced.get(e.actor, 1), battle.speed(e.actor)
     return 4 if e.kind == Entry.RAID else 2, 0, True, battle.speed(e.actor)
+
+
+def priority(battle, actor, number):
+    """A move's priority bracket: Prankster raises a status move's by 1."""
+    move = MOVES.get(number) or {}
+    prio = move.get("priority", 0)
+    return prio + 1 if battle.b[actor].ability == PRANKSTER and move.get("category") == "Status" else prio
+
+
+def paced(battle, actor, number):
+    """The 0x51 value: 0 for Stall, and for Mycelium Might's status moves (last in their bracket)."""
+    if battle.b[actor].ability == STALL:
+        return 0
+    return int(not (battle.b[actor].ability == MYCELIUM_MIGHT and (MOVES.get(number) or {}).get("category") == "Status"))
 
 
 def sort(battle, entries):
@@ -958,7 +977,7 @@ def run_actions(battle, entries):
     q += sort(battle, entries)
     for e in entries:
         if e.kind == Entry.MOVE:
-            battle.paced[e.actor] = int(battle.b[e.actor].ability != STALL)
+            battle.paced[e.actor] = paced(battle, e.actor, e.move)
             q += queue.encode(0x51, (e.actor, battle.paced[e.actor]))
     q += sort(battle, entries) + sort(battle, entries)
     while True:
@@ -1159,7 +1178,7 @@ def build(battle, slot, command):
             live = {k for k in live if k == "onResidual" or k.startswith("onAny")}
         if live:
             raise Unsupported(f"battler {b.id}'s ability {b.ability} or item {b.item}: {sorted(live)[0]}")
-    key = lambda a: ((MOVES.get(a[1]) or {}).get("priority", 0), battle.b[a[0]].ability != STALL, battle.speed(a[0]))
+    key = lambda a: (priority(battle, a[0], a[1]), paced(battle, a[0], a[1]), battle.speed(a[0]))
     if len({key(a) for a in acts}) != len(acts) and any(a[1] in HANDLER_MOVES for a in acts):
         raise Unsupported("a speed tie with a handler move")
     entries = [Entry(a, Entry.MOVE, move=n, position=p) for a, n, p in acts]
