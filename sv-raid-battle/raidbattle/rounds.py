@@ -48,6 +48,7 @@ AIR_BALLOON = 541
 SHIELDS_DOWN = 197
 LEVITATE = 26
 ICE_SCALES = 246
+PURIFYING_SALT = 272
 FILTER, SOLID_ROCK, PRISM_ARMOR = 111, 116, 232
 # abilities a mold breaker ignores that change a hit here (Showdown flag breakable): Sturdy, Battle and Shell
 # Armor, Levitate, Thick Fat, Shield Dust, Inner Focus, Own Tempo, Filter, Solid Rock, Ice Scales, Clear Body
@@ -278,6 +279,8 @@ class Battle:
             att = modify(att, 1.5)                          # Showdown abilities.ts: Hustle, on the stat
         if d.ability == THICK_FAT and move["type"] in ("Fire", "Ice") and a.ability not in MOLD_BREAKERS:
             att = modify(att, 0.5)
+        if d.ability == PURIFYING_SALT and move["type"] == "Ghost" and a.ability not in MOLD_BREAKERS:
+            att = modify(att, 0.5)                          # Showdown abilities.ts: Purifying Salt, on the stat
         power, own = self.move_power(actor, target, move)
         boosted = TYPE_BOOSTS.get(str(a.item)) == move["type"]
         ability_boost = {STRONG_JAW: 1.5 if "bite" in move["flags"] else 0,
@@ -649,7 +652,7 @@ def strike(battle, actor, target, number, move, code, i, hits):
                 continue
             if sec.get("volatileStatus") == "saltcure" and not knockout:
                 if target in battle.salted:
-                    raise Unsupported("Salt Cure on a salted target")
+                    continue                                # already salted: nothing shows
                 battle.salted[target] = actor                   # condition 46 until it faints
                 drops += queue.encode(0x13, (target, 46, 0, 1, actor)) + message(actor, 1033, target, actor)
                 continue
@@ -1072,6 +1075,7 @@ def status_use(battle, actor, number, position):
     if move.get("status"):
         cond = STATUS[move["status"]][0]
         if battle.status.get(target) or STATUS_IMMUNE_TYPES[cond] & set(battle.defending(target)) or \
+                battle.b[target].ability == PURIFYING_SALT or \
                 battle.effectiveness(move["type"], target) == 0 and move["name"] == "Thunder Wave":
             raise Unsupported("a status move that fails")
     if not own and "powder" in move["flags"] and "Grass" in battle.defending(target):
@@ -1183,6 +1187,8 @@ def inflict(battle, actor, target, name, turns=0):
     cond, code, text = STATUS[name]
     if battle.status.get(target) or STATUS_IMMUNE_TYPES[cond] & set(battle.defending(target)):
         return b""
+    if battle.b[target].ability == PURIFYING_SALT and battle.b[actor].ability not in MOLD_BREAKERS:
+        return b""                                          # a secondary's status fails silently; status moves refuse it
     if battle.b[target].ability in STATUS_GUARDS:
         raise Unsupported(f"battler {target}'s ability {battle.b[target].ability} against a status")
     if SAFEGUARD in battle.sides[int(target == BOSS)] and actor != target:
@@ -1319,7 +1325,7 @@ def boss_down(battle, actor, number, quiet=False):
 PENALIZED = frozenset((1, 3))       # the host's and the console's Pokemon: a faint costs battle time
 
 
-def player_down(battle, victim, actor, number, quiet=False):
+def player_down(battle, victim, actor, number, quiet=False, src=None):
     """A player's Pokemon knocked out, after the hit's record: as the boss's knockout with the victim's id
     (inside a multi-hit move without the fainted message), 0x41 (b, V) for each battler still standing, no
     0x80, and for the host's or the console's Pokemon
@@ -1336,7 +1342,10 @@ def player_down(battle, victim, actor, number, quiet=False):
     for e in battle.entries:
         if e.actor == victim:
             e.done = True                                   # its actions are marked run
-    q = queue.encode(0x49, (victim, actor, number)) + queue.encode(0x09, (actor, battle.slot(actor, number) or 0))
+    if src is not None:                                     # at a turn's end: no attacker, no 0x09
+        q = queue.encode(0x49, (victim, 0, 0))
+    else:
+        q = queue.encode(0x49, (victim, actor, number)) + queue.encode(0x09, (actor, battle.slot(actor, number) or 0))
     q += queue.encode(0x37, (victim, 1, 1)) + (b"" if quiet else message(victim, 0, victim)) + queue.encode(0x94, (victim, 0))
     q += queue.encode(0x37, (victim, 8, 1))
     q += b"".join(queue.encode(c, (victim,)) for c in (0x5F, 0x62, 0x6C, 0x5D))
@@ -1347,7 +1356,8 @@ def player_down(battle, victim, actor, number, quiet=False):
         n = faint_penalty(battle)
         battle.timer_offset -= n
         q += queue.encode(0x81, (-n & 0xFFFF,))
-    return q + queue.encode(0x38, (actor,))
+    by = actor if src is None else src
+    return q + (queue.encode(0x38, (by,)) if (by == BOSS) != (victim == BOSS) else b"")     # only from a foe
 
 
 def f32(x):
@@ -1427,6 +1437,8 @@ def callbacks(b, battle=None, acts=()):
         live.discard("onFractionalPriority")            # order_key and the 0x51 pass apply them
     if b.ability in (FILTER, SOLID_ROCK):
         live.discard("onSourceModifyDamage")            # Battle.damage applies them
+    if b.ability == PURIFYING_SALT:
+        live -= {"onSourceModifyAtk", "onSourceModifySpA", "onSetStatus"}   # Battle.damage and inflict apply them
     if b.ability == TANGLED_FEET and b.id in getattr(battle, "confused", {}):
         live.add("onModifyAccuracy")                    # confused, it is harder to hit
     if b.ability == TOXIC_BOOST and battle is not None and battle.status.get(b.id, (0,))[0] == PSN:
@@ -1914,6 +1926,21 @@ def residual_idle(battle, b):
     return False
 
 
+def residual_knockout(battle, b, dmg):
+    """Whether turn-end damage knocks battler b out; the boss's is refused."""
+    if dmg < battle.hp[b]:
+        return False
+    if b == BOSS:
+        raise Unsupported("the boss knocked out at a turn's end")
+    return True
+
+
+def residual_down(battle, victim, src):
+    """A player knocked out at a turn's end: the knockout commands with 0x49 (V, 0, 0), no 0x09, and 0x38 (the
+    battler whose effect dealt the damage, the sandstorm's raiser) only when that battler is a foe."""
+    return player_down(battle, victim, 0, 0, src=src)
+
+
 def salt(battle, b):
     """Salt Cure's damage at residual kind 46: an eighth of the record HP (a quarter for Water or Steel), at
     least 1: 0xa7 (b's position, 152), 0x01 (b, the salter, damage, 0), 0x9a, message 125 (b, 864)."""
@@ -1921,13 +1948,13 @@ def salt(battle, b):
     dmg = max(1, full // (4 if {"Water", "Steel"} & set(battle.defending(b)) else 8))
     if battle.b[b].ability == MAGIC_GUARD:
         raise Unsupported("Magic Guard against Salt Cure")
-    if dmg >= battle.hp[b]:
-        raise Unsupported("a knockout at a turn's end")
+    src, down = battle.salted[b], residual_knockout(battle, b, dmg)
     if b == BOSS and boss_trigger(battle, dmg):
         raise Unsupported("a boss HP trigger at a turn's end")
-    battle.hp[b] -= dmg
-    q = queue.encode(0xA7, (POSITION[b], 152)) + queue.encode(0x01, (b, battle.salted[b], dmg, 0))
-    return q + queue.encode(0x9A, (b, -dmg & 0xFFFFFFFF)) + message(b, 125, b, 864)
+    battle.hp[b] = max(0, battle.hp[b] - dmg)
+    q = queue.encode(0xA7, (POSITION[b], 152)) + queue.encode(0x01, (b, src, dmg, 0))
+    q += queue.encode(0x9A, (b, -dmg & 0xFFFFFFFF)) + message(b, 125, b, 864)
+    return q + (residual_down(battle, b, src) if down else b"")
 
 
 def residual(battle, b, kind):
@@ -1949,13 +1976,15 @@ def residual(battle, b, kind):
         dmg, code, how, text = max(1, full // 8), 43, 38, 82
     if battle.b[b].ability in (MAGIC_GUARD, 90):                # Magic Guard, Poison Heal
         raise Unsupported(f"battler {b}'s ability {battle.b[b].ability} against a status's damage")
-    if dmg >= battle.hp[b]:
-        raise Unsupported("a knockout at a turn's end")
+    src, down = st[2], residual_knockout(battle, b, dmg)
+    if down:
+        raise Unsupported("a knockout by a status at a turn's end")     # not in the corpus
     if b == BOSS and boss_trigger(battle, dmg):
         raise Unsupported("a boss HP trigger at a turn's end")
-    battle.hp[b] -= dmg
-    q = queue.encode(0xA7, (POSITION[b], code)) + queue.encode(0x01, (b, st[2], dmg, how))
-    return q + queue.encode(0x9A, (b, -dmg & 0xFFFFFFFF)) + message(b, text, b)
+    battle.hp[b] = max(0, battle.hp[b] - dmg)
+    q = queue.encode(0xA7, (POSITION[b], code)) + queue.encode(0x01, (b, src, dmg, how))
+    q += queue.encode(0x9A, (b, -dmg & 0xFFFFFFFF)) + message(b, text, b)
+    return q + (residual_down(battle, b, src) if down else b"")
 
 
 SAFETY_GOGGLES = 650
@@ -1989,15 +2018,16 @@ def sandstorm(battle, order):
         if b.ability in (MAGIC_GUARD, SHIELDS_DOWN):
             raise Unsupported(f"battler {i}'s ability {b.ability} in the sandstorm")
         dmg = max(1, b.stats[0] // 16)
-        if dmg >= battle.hp[i]:
-            raise Unsupported("a knockout")
+        down = residual_knockout(battle, i, dmg)
         if i == BOSS:
             if boss_trigger(battle, dmg):
                 raise Unsupported("a boss HP trigger")
-        battle.hp[i] -= dmg
+        battle.hp[i] = max(0, battle.hp[i] - dmg)
         battle.sand_hurt.add(i)
         q += message(i, 133, i) + queue.encode(0xA7, (POSITION[i], 14)) + queue.encode(0x01, (i, battle.weather_by, dmg, 1))
         q += queue.encode(0x9A, (i, -dmg & 0xFFFFFFFF))
+        if down:
+            q += residual_down(battle, i, battle.weather_by)
     return q
 
 
