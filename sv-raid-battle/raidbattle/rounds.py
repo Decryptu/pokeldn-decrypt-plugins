@@ -1828,7 +1828,7 @@ def sandstorm(battle, order):
             continue
         if b.ability in SAND_IMMUNE:
             continue
-        if b.ability in (MAGIC_GUARD, SHIELDS_DOWN) or b.ability in PINCH:
+        if b.ability in (MAGIC_GUARD, SHIELDS_DOWN):
             raise Unsupported(f"battler {i}'s ability {b.ability} in the sandstorm")
         dmg = max(1, b.stats[0] // 16)
         if dmg >= battle.hp[i]:
