@@ -880,7 +880,7 @@ def status_use(battle, actor, number, position):
     if not own and not move.get("status") and all(battle.stages[target][STATS[k]] == -6 for k in move["boosts"]):
         if any(d >= 0 for d in move["boosts"].values()):
             raise Unsupported("a raise on a foe")
-        stat_drop(battle, actor, target, {})                    # what answers a drop still refuses
+        stat_drop(battle, actor, target, {}, secondary=False)   # what answers a drop still refuses
         return immune(battle, actor, target, number, move, position, floor=True)
     r = battle.rng
     if type(move["accuracy"]) is int:
@@ -905,7 +905,7 @@ def status_use(battle, actor, number, position):
     elif own:
         q += raise_stats(battle, actor, move["boosts"])
     else:
-        q += stat_drop(battle, actor, target, move["boosts"])
+        q += stat_drop(battle, actor, target, move["boosts"], secondary=False)
     q += queue.encode(0x7C, ())
     q += pp(battle, 0x08, actor, number)
     q += queue.encode(0x1D, (actor, position, TYPES.index(move["type"]), 1, 0, number, number))
@@ -930,14 +930,28 @@ INTIMIDATE_ONLY = frozenset({12, 20, 39, 113, 275})        # Oblivious, Own Temp
 STAT_GUARD = {51: 6, 52: 1, 145: 2}                         # Keen Eye, Hyper Cutter, Big Pecks
 
 
-def stat_drop(battle, actor, target, boosts):
-    """A secondary's stat drop on the target: 0x0d and 0x93 (target, stat, stages), then message 31 +
-    stat for one stage, 38 + stat for two, from the attacker."""
+CLEAR_BODIES = frozenset({29, 73, 230})                     # Clear Body, White Smoke, Full Metal Body
+DEFIANT, COMPETITIVE = 128, 172                             # answer a foe's drop: +2 Attack, +2 Special Attack
+
+
+def stat_drop(battle, actor, target, boosts, secondary=True):
+    """A stat drop on the target: 0x0d and 0x93 (target, stat, stages), then message 31 + stat for one
+    stage, 38 + stat for two, from the attacker. Clear Body and its kin block a secondary's drop silently;
+    Defiant and Competitive answer a foe's drop of one stat with +2 inside their activation."""
     b = battle.b[target]
+    breaker = battle.b[actor].ability in MOLD_BREAKERS
+    if b.ability in CLEAR_BODIES and not breaker and boosts:
+        if not secondary:
+            raise Unsupported("Clear Body against a status move")
+        return b""
+    answer = b.ability in (DEFIANT, COMPETITIVE) and (actor == BOSS) != (target == BOSS)
     item = set() if b.item in (0, *IDLE_ITEMS) else set(ITEMS.get(str(b.item), ["unknown"]))
-    ability = set() if b.ability in INTIMIDATE_ONLY | set(STAT_GUARD) else set(ABILITIES.get(str(b.ability), ["unknown"]))
+    ability = set() if b.ability in INTIMIDATE_ONLY | set(STAT_GUARD) | CLEAR_BODIES | {DEFIANT, COMPETITIVE} \
+        else set(ABILITIES.get(str(b.ability), ["unknown"]))
     if ability & BOOST_ANSWERS or item & (BOOST_ANSWERS | {"onUpdate"}):
         raise Unsupported(f"battler {target}'s ability {b.ability} or item {b.item} answers a stat drop")
+    if answer and len(boosts) > 1:
+        raise Unsupported("Defiant or Competitive against a drop of several stats")
     q = b""
     for key, delta in ordered(boosts):
         stat, n = STATS[key], -delta
@@ -948,6 +962,13 @@ def stat_drop(battle, actor, target, boosts):
         battle.stages[target][stat] -= n
         q += queue.encode(0x0D, (target, stat, n)) + queue.encode(0x93, (target, stat, n, 0))
         q += message(actor, (31 if n == 1 else 38) + stat, target, stat)
+    if answer and boosts:
+        up = 1 if b.ability == DEFIANT else 3
+        if battle.stages[target][up] + 2 > 6:
+            raise Unsupported("Defiant or Competitive near +6")
+        battle.stages[target][up] += 2
+        q += queue.encode(0x25, (target,)) + queue.encode(0xC7, (target, 0)) + queue.encode(0x0C, (target, up, 2))
+        q += queue.encode(0x92, (target, up, 2, 0)) + message(target, RAISE_TEXT[2] + up, target) + queue.encode(0xC8, (target,))
     return q
 
 
