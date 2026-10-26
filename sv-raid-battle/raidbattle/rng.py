@@ -45,6 +45,14 @@ class Random:
             if x < 100:
                 return x < percent
 
+    def percent(self):
+        """-> a number below 100: the draw's low 7 bits, redrawn while 100 or more (the multi-hit roll)."""
+        self.count += 1
+        while True:
+            x = self.next() & 0x7F
+            if x < 100:
+                return x
+
     def skip(self):
         """One call that steps the state once and returns nothing used."""
         self.count += 1

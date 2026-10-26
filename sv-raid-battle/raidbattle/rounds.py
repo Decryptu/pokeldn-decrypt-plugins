@@ -211,7 +211,7 @@ def plain(move):
         raise Unsupported("not a damaging move")
     if move.get("isNonstandard") in ("Past", "LGPE", "Gmax", "Future"):
         raise Unsupported(f"{move['name']} is not a Scarlet / Violet move")   # its game data differs
-    for key in ("multihit", "self", "volatileStatus", "status", "boosts"):
+    for key in ("self", "volatileStatus", "status", "boosts"):
         if key in move:
             raise Unsupported(f"a move with {key}")
     if set(move["callbacks"]) - IDLE_MOVE_CALLBACKS.get(move["name"], set()):
@@ -251,16 +251,71 @@ def use(battle, actor, number, position):
     if type(move["accuracy"]) is int and (battle.stages[actor][6] or battle.stages[target][7]):
         raise Unsupported("an accuracy or evasion stage")
     if type(move["accuracy"]) is int and not r.chance(move["accuracy"]):
-        raise Unsupported("a miss")
-    # Battle Armor and Shell Armor (Showdown onCriticalHit false): no critical-hit draw
-    crit = battle.b[target].ability not in CRIT_GUARD and r.below(CRIT_DRAW[move.get("critRatio", 1)]) == 0
-    roll = r.below(16)
+        return immune(battle, actor, target, number, move, position, missed=True)
+    hits = move.get("multihit", 1)
+    if hits == [2, 5]:
+        x = r.percent()                                     # 0x19d4f2c: one roll below 100
+        hits = 2 if x < 35 else 3 if x < 70 else 4 if x < 85 else 5
+    if not isinstance(hits, int):
+        raise Unsupported(f"multihit {hits}")
     e = battle.effectiveness(move["type"], target)
     if move["type"] == "Ground" and battle.b[target].item == AIR_BALLOON:
         raise Unsupported("a Ground move into an Air Balloon")
     if e not in EFFECTIVENESS:
         raise Unsupported(f"effectiveness {e}")
     code = EFFECTIVENESS[e]
+    mtype, cat = TYPES.index(move["type"]), 1 if move["category"] == "Physical" else 2
+    apos, tpos = POSITION[actor], POSITION[target]
+    q = b""
+    if actor != BOSS:
+        q += queue.encode(0x05, (actor, battle.slot(actor, number), 2 if battle.b[target].ability == PRESSURE else 1))
+    q += pp(battle, 0x07, actor, number)
+    q += queue.encode(0xC9, (actor, 0, number, tpos, 0))
+    q += queue.encode(0x7B, (number, battle.rounds, actor))
+    for size in (20, 5, 5, 5, 19):
+        q += queue.encode_group(0xCF, bytes(size))
+    total, done = 0, 0
+    for i in range(hits):
+        q += queue.encode_group(0xCF, bytes(20))
+        part, dmg, knockout, faint = strike(battle, actor, target, number, move, code, i, hits)
+        q += part
+        total += dmg
+        done += 1
+        if knockout or faint:
+            break
+    if hits > 1:
+        if code != 7:
+            q += queue.encode(0xCA, (actor, 574 if code > 7 else 575, END) + (0,) * 7)
+        q += queue.encode(0xCA, (actor, 516, done, END) + (0,) * 6)
+        if code > 7:
+            q += queue.encode(0x20, (actor, 24)) * done
+        q += queue.encode(0xA6, (96,))
+    if "recoil" in move:
+        q += recoil(battle, actor, move, total, knockout or faint)
+    q += queue.encode(0x2E, (2, actor - 1))
+    if target == BOSS:
+        q += queue.encode(0x85, (7, total))
+    q += queue.encode(0x7C, ())
+    q += pp(battle, 0x08, actor, number)
+    q += queue.encode(0x1D, (actor, tpos, mtype, 1, 0, number, number))
+    q += queue.encode(0x5B, (actor, number)) * 2
+    q += queue.encode(0x1E, (actor, 0))
+    return q
+
+
+def strike(battle, actor, target, number, move, code, i, hits):
+    """-> (the queue of hit i of `hits`, its damage, whether it knocked the boss out, a player out): the
+    hit's flags (0x7e), record (0x8b, the hit index and the hits for a multi-hit move), damage, messages, record
+    (0x42), its effects and 0xd1."""
+    r = battle.rng
+    multi = hits > 1
+    if multi and (secondaries(move) or "drain" in move or battle.b[target].ability in CONTACT_STATUS
+                  or battle.b[actor].ability == POISON_TOUCH and "contact" in move["flags"]
+                  or battle.b[target].item == AIR_BALLOON or battle.b[target].ability in (RATTLED, SAND_SPIT)):
+        raise Unsupported("a multi-hit move with an effect")
+    # Battle Armor and Shell Armor (Showdown onCriticalHit false): no critical-hit draw
+    crit = battle.b[target].ability not in CRIT_GUARD and r.below(CRIT_DRAW[move.get("critRatio", 1)]) == 0
+    roll = r.below(16)
     dmg = battle.damage(actor, target, move, roll, crit)
     if target == BOSS:
         dmg = battle.raid.damage(dmg)
@@ -305,19 +360,11 @@ def use(battle, actor, number, position):
     e5[tpos] = code
     hit = [0] * 5
     hit[tpos] = 1
-    q = b""
-    if actor != BOSS:
-        q += queue.encode(0x05, (actor, battle.slot(actor, number), 2 if battle.b[target].ability == PRESSURE else 1))
-    q += pp(battle, 0x07, actor, number)
-    q += queue.encode(0xC9, (actor, 0, number, tpos, 0))
-    q += queue.encode(0x7B, (number, battle.rounds, actor))
-    for size in (20, 5, 5, 5, 19, 20):
-        q += queue.encode_group(0xCF, bytes(size))
-    q += queue.encode(0x7E, (0, *hit))
+    q = queue.encode(0x7E, (0, *hit))
     q += queue.encode(0x7E, (1, *[int(crit) * h for h in hit]))
     q += queue.encode(0x7E, (2, *e5))
-    q += queue.encode(0x8B, (apos, tpos, number, mtype, 0, 0, 1, int(battle.tera_move(actor, move)),
-                             TARGET_CLASS.get(move["target"], 0), 0))
+    q += queue.encode(0x8B, (apos, tpos, number, mtype, 0, i, 1, int(battle.tera_move(actor, move)),
+                             TARGET_CLASS.get(move["target"], 0), hits if multi else 0))
     if crit:
         q += queue.encode(0x37, (actor, 0, 1))
     q += queue.encode(0x37, (target, 2, dmg)) + queue.encode(0x37, (target, 5, 1))
@@ -328,8 +375,9 @@ def use(battle, actor, number, position):
     else:
         weak = code > 7
         q += queue.encode(0x8E, (1, 2 if weak else 3, number))
-        q += queue.encode(0xCA, (actor, 574 if weak else 575, END) + (0,) * 7)
-    if code > 7:
+        if not multi:
+            q += queue.encode(0xCA, (actor, 574 if weak else 575, END) + (0,) * 7)
+    if code > 7 and not multi:
         q += queue.encode(0x20, (actor, 24))
     if crit:
         q += queue.encode(0xA7, (tpos, 131)) + queue.encode(0x20, (actor, 26))
@@ -363,17 +411,7 @@ def use(battle, actor, number, position):
     elif faint:
         q += player_down(battle, target, actor, number)
     q += queue.encode(0xD1, bytes([1, 0]))
-    if "recoil" in move:
-        q += recoil(battle, actor, move, dmg, knockout or faint)
-    q += queue.encode(0x2E, (2, actor - 1))
-    if target == BOSS:
-        q += queue.encode(0x85, (7, dmg))
-    q += queue.encode(0x7C, ())
-    q += pp(battle, 0x08, actor, number)
-    q += queue.encode(0x1D, (actor, tpos, mtype, 1, 0, number, number))
-    q += queue.encode(0x5B, (actor, number)) * 2
-    q += queue.encode(0x1E, (actor, 0))
-    return q
+    return q, dmg, knockout, faint
 
 
 def sand_spit(battle, b):
@@ -402,8 +440,9 @@ def recoil(battle, actor, move, dmg, knockout):
     return q + message(actor, 127, actor) + queue.encode(0x37, (actor, 4, r))
 
 
-def immune(battle, actor, target, number, move, position):
-    """A damaging move the target's types are immune to: no draw; five zero groups, message 72."""
+def immune(battle, actor, target, number, move, position, missed=False):
+    """A damaging move the target's types are immune to (no draw), or one that missed: five zero groups,
+    message 72 and 0x52 (A, 3), or message 73 and 0x52 (A, 1)."""
     mtype = TYPES.index(move["type"])
     q = b""
     if actor != BOSS:
@@ -412,7 +451,8 @@ def immune(battle, actor, target, number, move, position):
     q += queue.encode(0x7B, (number, battle.rounds, actor))
     for size in (20, 5, 5, 5, 19):
         q += queue.encode_group(0xCF, bytes(size))
-    q += message(actor, 72, target) + queue.encode(0x52, (actor, 3)) + pp(battle, 0x08, actor, number)
+    q += message(actor, 73 if missed else 72, target) + queue.encode(0x52, (actor, 1 if missed else 3))
+    q += pp(battle, 0x08, actor, number)
     q += queue.encode(0x52, (actor, 0)) + queue.encode(0x1D, (actor, position, mtype, 0, 0, number, number))
     q += queue.encode(0x5B, (actor, number)) * 2 + queue.encode(0x1E, (actor, 0))
     return q
