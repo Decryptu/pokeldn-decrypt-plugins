@@ -66,7 +66,11 @@ TOXIC_VALUE = 7801
 STATUS_IMMUNE_TYPES = {PAR: {"Electric"}, BRN: {"Fire"}, FRZ: {"Ice"}, PSN: {"Poison", "Steel"}, SLP: set()}
 # Showdown abilities.ts: abilities that refuse a status (refused when one would land)
 STATUS_GUARDS = frozenset((7, 15, 17, 40, 41, 72, 102, 166, 175, 197, 199, 213, 257, 270, 272))
-GUTS = 62     # 0x8b's ninth argument; 0 for one target
+GUTS = 62
+HUSTLE, THICK_FAT, STRONG_JAW, RECKLESS, TINTED_LENS = 55, 47, 173, 120, 110
+SERENE_GRACE, SHIELD_DUST, COMPOUND_EYES, SKILL_LINK, STENCH = 32, 19, 14, 92, 1
+# abilities that act only through a held item (a berry, an item to steal or pass on)
+ITEM_ABILITIES = frozenset((82, 124, 180, 247, 291))   # Gluttony, Pickpocket, Symbiosis, Ripen, Cud Chew     # 0x8b's ninth argument; 0 for one target
 EFFECTIVENESS = {0.25: 5, 0.5: 6, 1: 7, 2: 8, 4: 9}
 
 
@@ -189,8 +193,18 @@ class Battle:
             att = modify(att, 1.5)                          # Showdown: Overgrow, Blaze, Torrent, Swarm
         if a.ability in (HUGE_POWER, PURE_POWER) and physical:
             att = modify(att, 2)
+        if a.ability == HUSTLE and physical:
+            att = modify(att, 1.5)                          # Showdown abilities.ts: Hustle, on the stat
+        if d.ability == THICK_FAT and move["type"] in ("Fire", "Ice") and a.ability not in MOLD_BREAKERS:
+            att = modify(att, 0.5)
         power = move["basePower"]
         boosted = TYPE_BOOSTS.get(str(a.item)) == move["type"]
+        ability_boost = {STRONG_JAW: 1.5 if "bite" in move["flags"] else 0,
+                         RECKLESS: 4915 / 4096 if "recoil" in move else 0}.get(a.ability, 0)
+        if boosted and ability_boost:
+            raise Unsupported("an ability's power chained with a type item")
+        if ability_boost:
+            power = modify(power, ability_boost)            # Showdown abilities.ts: Strong Jaw, Reckless
         if boosted:
             power = modify(power, 4915 / 4096)              # Showdown items.ts: Charcoal, Spell Tag and kin
         if a.ability == RIVALRY and a.gender < 2 and d.gender < 2:
@@ -205,6 +219,8 @@ class Battle:
         x = modify(x, self.stab(actor, move["type"]))
         e = self.effectiveness(move["type"], target)
         x = int(x * e)
+        if a.ability == TINTED_LENS and e < 1:
+            x = modify(x, 2)                                # Showdown abilities.ts: Tinted Lens
         if physical and self.status.get(actor, (0,))[0] == BRN:
             if a.ability == GUTS or move["name"] == "Facade":
                 raise Unsupported("Guts or Facade while burned")
@@ -269,12 +285,12 @@ def use(battle, actor, number, position):
         return immune(battle, actor, target, number, move, position)
     if type(move["accuracy"]) is int and (battle.stages[actor][6] or battle.stages[target][7]):
         raise Unsupported("an accuracy or evasion stage")
-    if type(move["accuracy"]) is int and not r.chance(move["accuracy"]):
+    if type(move["accuracy"]) is int and not r.chance(accuracy(battle, actor, move)):
         return immune(battle, actor, target, number, move, position, missed=True)
     hits = move.get("multihit", 1)
     if hits == [2, 5]:
-        x = r.percent()                                     # 0x19d4f2c: one roll below 100
-        hits = 2 if x < 35 else 3 if x < 70 else 4 if x < 85 else 5
+        x = r.percent()                                     # 0x19d4f2c: one roll below 100, drawn under Skill Link too
+        hits = 5 if battle.b[actor].ability == SKILL_LINK else 2 if x < 35 else 3 if x < 70 else 4 if x < 85 else 5
     if not isinstance(hits, int):
         raise Unsupported(f"multihit {hits}")
     e = battle.effectiveness(move["type"], target)
@@ -312,7 +328,7 @@ def use(battle, actor, number, position):
         if code > 7:
             q += queue.encode(0x20, (actor, 24)) * done
         q += queue.encode(0xA6, (96,))
-    if "recoil" in move:
+    if "recoil" in move and battle.b[actor].ability != ROCK_HEAD:
         q += recoil(battle, actor, move, total, knockout or faint)
     q += queue.encode(0x2E, (2, actor - 1))
     if target == BOSS:
@@ -323,6 +339,17 @@ def use(battle, actor, number, position):
     q += queue.encode(0x5B, (actor, number)) * 2
     q += queue.encode(0x1E, (actor, 0))
     return q
+
+
+def accuracy(battle, actor, move):
+    """The accuracy a move draws against: Hustle's 3277/4096 on a physical move, Compound Eyes' 5325/4096."""
+    acc = move["accuracy"]
+    a = battle.b[actor].ability
+    if a == HUSTLE and move["category"] == "Physical":
+        acc = modify(acc, 3277 / 4096)
+    elif a == COMPOUND_EYES:
+        acc = modify(acc, 5325 / 4096)
+    return min(acc, 100)
 
 
 def strike(battle, actor, target, number, move, code, i, hits):
@@ -354,7 +381,14 @@ def strike(battle, actor, target, number, move, code, i, hits):
     if knockout or faint:
         r.chance(0)                                         # drawn by every hit that knocks a battler out
     drops = b""
-    for sec in secondaries(move) if not knockout else ():  # a knocked-out boss draws none
+    secs = secondaries(move)
+    if battle.b[actor].ability == STENCH and not any(x.get("volatileStatus") == "flinch" for x in secs):
+        secs = [{"chance": 10, "volatileStatus": "flinch"}] + secs     # drawn before the move's own
+    if battle.b[target].ability == SHIELD_DUST and battle.b[actor].ability not in MOLD_BREAKERS:
+        secs = []
+    if battle.b[actor].ability == SERENE_GRACE:
+        secs = [dict(x, chance=x["chance"] * 2) for x in secs]
+    for sec in secs if not knockout else ():               # a knocked-out boss draws none
         guarded = battle.b[target].ability == INNER_FOCUS and battle.b[actor].ability not in MOLD_BREAKERS
         if sec.get("volatileStatus") == "flinch" and (target == BOSS or guarded):
             continue                                        # the boss, or Inner Focus, cannot flinch: no draw
@@ -469,7 +503,7 @@ def recoil(battle, actor, move, dmg, knockout):
     0x9a (A, -r), message 127, 0x37 (A, 4, r)."""
     n, d = move["recoil"]
     r = max(1, int(dmg * n / d + 0.5))
-    if knockout or r >= battle.hp[actor] or battle.b[actor].ability in (ROCK_HEAD, MAGIC_GUARD):
+    if knockout or r >= battle.hp[actor] or battle.b[actor].ability == MAGIC_GUARD:
         raise Unsupported("recoil that faints, after a knockout, or under Rock Head or Magic Guard")
     battle.hp[actor] -= r
     q = queue.encode(0x01, (actor, actor, r, 4)) + queue.encode(0x9A, (actor, -r & 0xFFFFFFFF))
@@ -849,6 +883,22 @@ def callbacks(b, battle=None, acts=()):
         live.discard("onModifySTAB")
     if b.ability == RIVALRY:
         live.discard("onBasePower")                     # Battle.damage applies it
+    if b.ability in (HUSTLE, COMPOUND_EYES):
+        live -= {"onModifyAtk", "onSourceModifyAccuracy"}   # Battle.damage and accuracy() apply them
+    if b.ability in (THICK_FAT,):
+        live -= {"onSourceModifyAtk", "onSourceModifySpA"}
+    if b.ability in (STRONG_JAW, RECKLESS):
+        live.discard("onBasePower")
+    if b.ability == TINTED_LENS:
+        live.discard("onModifyDamage")
+    if b.ability in (SERENE_GRACE, STENCH, SKILL_LINK):
+        live.discard("onModifyMove")
+    if b.ability == SHIELD_DUST:
+        live.discard("onModifySecondaries")
+    if b.ability == ROCK_HEAD:
+        live.discard("onDamage")                        # use() leaves out the recoil
+    if b.ability in ITEM_ABILITIES and battle is not None and not any(x.item for x in battle.b.values()):
+        live = set()                                    # no item anywhere: nothing to eat, steal or pass
     if b.ability in CONTACT_STATUS or b.ability in (RATTLED, SAND_SPIT):
         live.discard("onDamagingHit")                   # use() draws it
     if b.ability == POISON_TOUCH:
@@ -963,7 +1013,7 @@ def run(battle, e, entries):
         if not goes:
             move = MOVES.get(e.move) or {"type": "Normal"}
             tail = queue.encode(0x5B, (e.actor, e.move)) * 2 + queue.encode(0x1E, (e.actor, 0))
-            if why == "status":
+            if why == "status" and e.actor == BOSS:       # only the boss's stopped move shows 0x1d
                 tail = queue.encode(0x1D, (e.actor, e.position, TYPES.index(move["type"]), 0, 0, e.move, e.move)) + tail
             return q + pre + tail
         return q + pre + use(battle, e.actor, e.move, e.position)
