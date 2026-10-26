@@ -2,6 +2,7 @@
 (pokeldn docs/sv_raid.md, A move in the round queue; Damage and draws per move). Only plain moves are
 built: a single-target damaging move with no effect that changes the battle beyond its damage. Anything
 else raises Unsupported."""
+import collections
 import json
 import os
 import struct
@@ -142,7 +143,8 @@ class Battle:
         self.terrain_left = 0                           # turn ends until the terrain ends
         self.fresh = set()                              # battlers revived since the last turn end
         self.charged = set()
-        self.spent = {}                                 # battler -> PP its current move spent (0x05)                            # battlers Wind Power charged (their next Electric move)
+        self.spent = {}
+        self.orb = collections.Counter()                # battler -> moves begun since its orb was last drained                                 # battler -> PP its current move spent (0x05)                            # battlers Wind Power charged (their next Electric move)
         self.sides = {0: {}, 1: {}}                     # side (0 players, 1 boss) -> {condition: [turns left, setter]}
         self.weather_left = 0                           # turn ends until the weather ends (0x79's 5)
         self.weather_by = 0                             # the battler that set it (0x01's second argument)
@@ -399,6 +401,7 @@ def use(battle, actor, number, position):
         q += queue.encode(0x05, (actor, battle.slot(actor, number), battle.spent.get(actor, 1)))
     q += pp(battle, 0x07, actor, number)
     q += queue.encode(0xC9, (actor, 0, number, tpos, 0))
+    battle.orb[actor] += actor != BOSS
     q += queue.encode(0x7B, (number, battle.rounds, actor))
     for size in (20, 5, 5, 5, 19):
         q += queue.encode_group(0xCF, bytes(size))
@@ -802,6 +805,7 @@ def weather_use(battle, actor, number, position, move):
         q += queue.encode(0x05, (actor, battle.slot(actor, number), battle.spent.get(actor, 1)))
     q += pp(battle, 0x07, actor, number)
     q += queue.encode(0xC9, (actor, 0, number, position, 0))
+    battle.orb[actor] += actor != BOSS
     q += queue.encode(0x7B, (number, battle.rounds, actor))
     q += queue.encode_group(0xCF, bytes(20))
     q += queue.encode(0x7E, (0, 0, 0, 0, 0, 0)) + queue.encode(0x7E, (1, 0, 0, 0, 0, 0))
@@ -888,6 +892,7 @@ def status_use(battle, actor, number, position):
         q += queue.encode(0x05, (actor, battle.slot(actor, number), battle.spent.get(actor, 1)))
     q += pp(battle, 0x07, actor, number)
     q += queue.encode(0xC9, (actor, 0, number, position, 0))
+    battle.orb[actor] += actor != BOSS
     q += queue.encode(0x7B, (number, battle.rounds, actor))
     q += queue.encode_group(0xCF, bytes(20))
     q += queue.encode(0x7E, (0, 0, 0, 0, 0, 0)) + queue.encode(0x7E, (1, 0, 0, 0, 0, 0))
@@ -1395,6 +1400,13 @@ def raid_action(battle, e, entries):
     if e.sub == raid.EXTRA:
         action, _timing, _value, move = r.extras[e.value]
         q = queue.encode(0x85, (raid.EXTRA, e.value)) + queue.encode(0xC1, (raid.EXTRA, action))
+        if action == raid.DRAIN_ORB:                        # each standing player with a charge: 0x76 (2, slot)
+            from raidbattle.battlers import SLOT
+            for b in sorted(SLOT, key=SLOT.get):
+                if b != BOSS and battle.hp[b] and battle.orb[b]:
+                    battle.orb[b] = 0
+                    q += queue.encode(0x76, (BOSS, SLOT[b]))
+            return q
         if action in (raid.RESET_BOSS, raid.RESET_PLAYERS):
             entries.append(Entry(BOSS, Entry.RESET, value=action))
         elif action == raid.MOVE:
