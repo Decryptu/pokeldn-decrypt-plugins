@@ -53,6 +53,10 @@ class Random:
             if x < 100:
                 return x
 
+    def duration(self, n):
+        """below(n) through a call the oracle's draw log does not show (a sleep's or a confusion's turns)."""
+        return self.below(n)
+
     def skip(self):
         """One call that steps the state once and returns nothing used."""
         self.count += 1

@@ -57,7 +57,16 @@ MOLD_BREAKERS = frozenset((104, 163, 164))      # Mold Breaker, Turboblaze, Tera
 POISON_TOUCH = 143                              # the attacker's
 RATTLED = 155                                   # +1 Speed, hit by a Bug, Dark or Ghost move
 STALL = 100                 # moves last in its bracket; 0x51 (b, 0) in the speed pass
-TARGET_CLASS = {"allAdjacent": 4, "allAdjacentFoes": 5}     # 0x8b's ninth argument; 0 for one target
+TARGET_CLASS = {"allAdjacent": 4, "allAdjacentFoes": 5}
+# major statuses: condition id, 0xa7 code and the infliction's message (pokeldn docs/sv_raid.md, Statuses)
+PAR, SLP, FRZ, BRN, PSN = 1, 2, 3, 4, 5
+STATUS = {"par": (PAR, 46, 92), "slp": (SLP, 42, 103), "frz": (FRZ, 45, 97), "brn": (BRN, 44, 86),
+          "psn": (PSN, 43, 79), "tox": (PSN, 43, 80)}
+TOXIC_VALUE = 7801
+STATUS_IMMUNE_TYPES = {PAR: {"Electric"}, BRN: {"Fire"}, FRZ: {"Ice"}, PSN: {"Poison", "Steel"}, SLP: set()}
+# Showdown abilities.ts: abilities that refuse a status (refused when one would land)
+STATUS_GUARDS = frozenset((7, 15, 17, 40, 41, 72, 102, 166, 175, 197, 199, 213, 257, 270, 272))
+GUTS = 62     # 0x8b's ninth argument; 0 for one target
 EFFECTIVENESS = {0.25: 5, 0.5: 6, 1: 7, 2: 8, 4: 9}
 
 
@@ -121,6 +130,10 @@ class Battle:
         self.faints = {i: 0 for i in battlers}          # times each battler fainted (the revive's wait)
         self.timer_offset = 0                           # seconds the faints took off the battle timer
         self.listed = []                                # battlers revived since the last round (0x23 first)
+        self.status = {}                                # battler -> [condition, value, source, toxic count]
+        self.confused = {}                              # battler -> turns of confusion left
+        self.flinched = set()                           # battlers a flinch stops this round
+        self.paced = {}                                 # battler -> its 0x51 value this round (Stall's 0)
 
     def slot(self, battler, number):
         """The move's slot in the battler's moveset (0x05, 0x07, 0x08); None for a move it does not know (a
@@ -129,8 +142,9 @@ class Battle:
         return moves.index(number) if number in moves else None if battler == BOSS else 0
 
     def speed(self, battler):
-        """The Speed the turn order reads: the stat at its stage."""
-        return staged(self.b[battler].speed, self.stages[battler][5])
+        """The Speed the turn order reads: the stat at its stage, halved while paralysed."""
+        spe = staged(self.b[battler].speed, self.stages[battler][5])
+        return modify(spe, 0.5) if self.status.get(battler, (0,))[0] == PAR else spe
 
     def defending(self, target):
         return [self.tera] if target == BOSS else self.types[target]
@@ -190,7 +204,12 @@ class Battle:
         x = base * (100 - roll) // 100
         x = modify(x, self.stab(actor, move["type"]))
         e = self.effectiveness(move["type"], target)
-        return int(x * e) if e >= 1 else int(x * e)
+        x = int(x * e)
+        if physical and self.status.get(actor, (0,))[0] == BRN:
+            if a.ability == GUTS or move["name"] == "Facade":
+                raise Unsupported("Guts or Facade while burned")
+            x = modify(x, 0.5)                              # Showdown getDamage: a burned user's physical move
+        return max(1, x)
 
 
 def message(battler, text, *params):
@@ -340,11 +359,22 @@ def strike(battle, actor, target, number, move, code, i, hits):
             continue                                        # a stat drop on a fainted player: no draw
         if faint and "status" in sec:
             raise Unsupported("a status secondary on a fainted player")
+        turns = 0
         if sec.get("volatileStatus") == "confusion":
-            r.skip()                                        # one step before the chance (oracle draw replay)
+            turns = 2 + r.duration(4)                       # the duration, drawn before the chance
+        elif sec.get("status") == "slp":
+            turns = 2 + r.duration(3)
         if r.chance(sec["chance"]) and not faint:          # a fainted player draws a flinch or confusion
-            if sec.get("volatileStatus") == "flinch" and target in battle.moved and not knockout:
+            if sec.get("volatileStatus") == "flinch":
+                if target not in battle.moved:
+                    battle.flinched.add(target)             # stops its move this round
                 continue                                    # a target that already moved: nothing shows
+            if "status" in sec and set(sec) == {"chance", "status"} and not knockout:
+                drops += inflict(battle, actor, target, sec["status"], turns)
+                continue
+            if sec.get("volatileStatus") == "confusion" and set(sec) == {"chance", "volatileStatus"} and not knockout:
+                drops += confuse(battle, actor, target, turns)
+                continue
             if set(sec) != {"chance", "boosts"} or knockout:
                 raise Unsupported("a secondary effect")
             drops += stat_drop(battle, actor, target, sec["boosts"])
@@ -411,6 +441,9 @@ def strike(battle, actor, target, number, move, code, i, hits):
     elif faint:
         q += player_down(battle, target, actor, number)
     q += queue.encode(0xD1, bytes([1, 0]))
+    if move["type"] == "Fire" and battle.hp[target] and battle.status.get(target, (0,))[0] == FRZ:
+        del battle.status[target]                           # a Fire hit thaws its target
+        q += queue.encode(0x14, (target,)) + queue.encode(0x90, (target, 0)) + message(target, 99, target)
     return q, dmg, knockout, faint
 
 
@@ -563,6 +596,61 @@ def stat_drop(battle, actor, target, boosts):
     return q
 
 
+def inflict(battle, actor, target, name, turns=0):
+    """A major status landing: 0x13 (T, condition, 0, value, A), 0x90 (T, condition), 0xa7 (T's position,
+    code), the message from the user; nothing on a target already statused or immune by its types."""
+    cond, code, text = STATUS[name]
+    if battle.status.get(target) or STATUS_IMMUNE_TYPES[cond] & set(battle.defending(target)):
+        return b""
+    if battle.b[target].ability in STATUS_GUARDS:
+        raise Unsupported(f"battler {target}'s ability {battle.b[target].ability} against a status")
+    value = TOXIC_VALUE if name == "tox" else turns << 3 | 2 if name == "slp" else 1
+    battle.status[target] = [cond, value, actor, 0, turns, name == "tox"]
+    q = queue.encode(0x13, (target, cond, 0, value, actor)) + queue.encode(0x90, (target, cond))
+    return q + queue.encode(0xA7, (POSITION[target], code)) + message(actor, text, target)
+
+
+def confuse(battle, actor, target, turns):
+    """Confusion landing: 0x13 (T, 6, 0, turns << 3 | 2, A), 0xa7 (T's position, 47), message 116."""
+    if target in battle.confused:
+        return b""
+    battle.confused[target] = turns
+    q = queue.encode(0x13, (target, 6, 0, turns << 3 | 2, actor))
+    return q + queue.encode(0xA7, (POSITION[target], 47)) + message(actor, 116, target)
+
+
+def stopped(battle, actor, number, text, code=None, handler_pair=True):
+    """A move its user's status stops: the status's message (and 0xa7), 0x52 (A, 0), 0x1d with no hit, the
+    two 0x5b and 0x1e."""
+    move = MOVES.get(number) or {"type": "Normal"}
+    q = message(actor, text, actor)
+    if code is not None:
+        q += queue.encode(0xA7, (POSITION[actor], code))
+    q += queue.encode(0x52, (actor, 0))
+    return q
+
+
+def before_move(battle, e):
+    """-> (the queue of what stops or precedes a move, whether the move goes on): a flinch, freeze (thawing
+    on chance(20)), sleep, full paralysis (chance(25))."""
+    actor = e.actor
+    st = battle.status.get(actor)
+    r = battle.rng
+    if actor in battle.flinched:
+        return message(actor, 122, actor) + queue.encode(0x52, (actor, 0)), False, "flinch"
+    if actor in battle.confused:
+        raise Unsupported("a confused battler moving")
+    if st and st[0] == FRZ:
+        if r.chance(20):
+            raise Unsupported("a thaw")
+        return stopped(battle, actor, e.move, 98, 45), False, "status"
+    if st and st[0] == SLP:
+        raise Unsupported("a sleeping battler moving")
+    if st and st[0] == PAR and r.chance(25):
+        return stopped(battle, actor, e.move, 93, 46), False, "status"
+    return b"", True, None
+
+
 def boss_down(battle, actor, number):
     """The boss knocked out, after the hit's record: the battle is won. 0x09 carries the knocking move's
     slot in its user's moveset (382 of 383 oracle knockouts)."""
@@ -705,10 +793,11 @@ class Entry:
 
 
 def order_key(battle, e):
-    """The action's order key: its class (4 a raid action, 2 a reset, 1 a move), the move's priority, not
-    Stall, then Speed (pokeldn docs/sv_raid.md, Speed ties)."""
+    """The action's order key: its class (4 a raid action, 2 a reset, 1 a move), the move's priority, the
+    battler's 0x51 value this round (0 for Stall; 1 in the round's first sort, before the 0x51 pass sets it),
+    then Speed (pokeldn docs/sv_raid.md, Speed ties)."""
     if e.moving():
-        return 1, (MOVES.get(e.move) or {}).get("priority", 0), battle.b[e.actor].ability != STALL, battle.speed(e.actor)
+        return 1, (MOVES.get(e.move) or {}).get("priority", 0), battle.paced.get(e.actor, 1), battle.speed(e.actor)
     return 4 if e.kind == Entry.RAID else 2, 0, True, battle.speed(e.actor)
 
 
@@ -725,14 +814,18 @@ def run_actions(battle, entries):
     order in the 0x51 pass), then the first action not yet run, again and again, re-sorted after each
     (pokeldn docs/sv_raid.md, Speed ties). After each, the boss's HP triggers (raid_turn)."""
     battle.moved = set()
+    battle.flinched = set()
+    battle.paced = {}                                       # each round's first sort: 1 for every move
     battle.entries = entries
     battle.raid.pending = []
     q = queue.encode(0xB5, (0,))
     q += b"".join(queue.encode(0x51, (b, 1)) for b in sorted({e.actor for e in entries}))
     q += unanswered(battle, entries)
     q += sort(battle, entries)
-    q += b"".join(queue.encode(0x51, (e.actor, int(battle.b[e.actor].ability != STALL)))
-                  for e in entries if e.kind == Entry.MOVE)
+    for e in entries:
+        if e.kind == Entry.MOVE:
+            battle.paced[e.actor] = int(battle.b[e.actor].ability != STALL)
+            q += queue.encode(0x51, (e.actor, battle.paced[e.actor]))
     q += sort(battle, entries) + sort(battle, entries)
     while True:
         e = next((e for e in entries if not e.done), None)
@@ -777,7 +870,15 @@ def run(battle, e, entries):
     if e.moving():
         battle.moved.add(e.actor)
     if e.kind == Entry.MOVE:
-        return q + handler(battle, (e.actor, e.move), 0x72000, last=False) + use(battle, e.actor, e.move, e.position)
+        q += handler(battle, (e.actor, e.move), 0x72000, last=False)
+        pre, goes, why = before_move(battle, e)
+        if not goes:
+            move = MOVES.get(e.move) or {"type": "Normal"}
+            tail = queue.encode(0x5B, (e.actor, e.move)) * 2 + queue.encode(0x1E, (e.actor, 0))
+            if why == "status":
+                tail = queue.encode(0x1D, (e.actor, e.position, TYPES.index(move["type"]), 0, 0, e.move, e.move)) + tail
+            return q + pre + tail
+        return q + pre + use(battle, e.actor, e.move, e.position)
     if e.kind == Entry.RAID:
         return raid_action(battle, e, entries)
     if e.kind == Entry.RESET:
@@ -818,7 +919,11 @@ def raid_action(battle, e, entries):
     if e.sub == raid.DOUBLE:
         raise Unsupported("the double action")
     x = 0 if e.sub == raid.LOW_TIME else e.value
-    return queue.encode(0x85, (e.sub, x)) + queue.encode(0xC1, (e.sub, x))
+    q = queue.encode(0x85, (e.sub, x)) + queue.encode(0xC1, (e.sub, x))
+    if e.sub == raid.SHIELD and battle.status.get(BOSS):
+        del battle.status[BOSS]                             # the shield cures the boss's status
+        q += queue.encode(0x14, (BOSS,)) + queue.encode(0x90, (BOSS, 0))
+    return q
 
 
 def reset(battle, action):
@@ -829,7 +934,10 @@ def reset(battle, action):
         if any(n > 0 for n in battle.stages[BOSS]):
             raise Unsupported("the boss's raised stats reset")
         battle.stages[BOSS] = [0] * 8
-        return queue.encode(0x0F, (BOSS,)) + queue.encode(0xC2, (3, 2, 2))
+        q = queue.encode(0x0F, (BOSS,))
+        if battle.status.pop(BOSS, None):
+            q += queue.encode(0x14, (BOSS,)) + queue.encode(0x90, (BOSS, 0))   # its status cured too
+        return q + queue.encode(0xC2, (3, 2, 2))
     standing = [b for b in sorted(battle.b) if b != BOSS and battle.hp[b]]
     suppressed = [b for b in standing if battle.b[b].ability not in CANT_SUPPRESS]
     if any(battle.b[b].suppressed for b in suppressed):
@@ -860,8 +968,9 @@ def round_end(battle, entries, acted, won, counted):
     sort's order, 0x23 for each battler revived since the last round then each that acted, 0x2d."""
     n = (battle.turns + 1) % TURN if counted else None
     # a round ends with three battler sorts, the second the 0x43 order; a turn's end with eight, the
-    # fourth or fifth its residual order (no tie told them apart), the seventh the 0x43 order
-    ends = [speed_order(battle, sorted(battle.b), battle.speed) for _ in range(3 if won or n != 0 else 8)]
+    # fourth or fifth its residual order (no tie told them apart), the seventh, after the turn's end, the
+    # 0x43 order (a Speed Boost there already counts)
+    ends = [speed_order(battle, sorted(battle.b), battle.speed) for _ in range(3 if won or n != 0 else 5)]
     if won and len({battle.speed(b) for b in battle.b}) != len(battle.b):
         raise Unsupported("a speed tie in the winning round")
     q = b""
@@ -874,6 +983,7 @@ def round_end(battle, entries, acted, won, counted):
             if ends[3] != ends[4] or "sand" in battle.field and len({tuple(e) for e in ends[1:6]}) > 1:
                 raise Unsupported("a speed tie at a turn's end")
             q += turn_end(battle, ends[3])
+            ends += [speed_order(battle, sorted(battle.b), battle.speed) for _ in range(3)]
         q += queue.encode(0xC5, (1,))
     q += b"".join(queue.encode(0x43, (b,)) for b in ends[1 if won or n != 0 else 6] if battle.hp[b])
     acted = battle.listed + [b for b in acted if b not in battle.listed]
@@ -969,6 +1079,7 @@ RESIDUALS = (36, 21, 18, 5, 4, 9, 10, 8, 46, 43, 48, 11, 12, 23, 13, 31, 33, 15,
              24, 45, 14, 20, 1, 2, 3, 7, 6, 16, 17, 22, 25, 26, 27, 28, 32, 34, 35)
 LEFTOVERS = 234
 MOODY = 141                 # idle in a round, acts at a turn's end
+SPEED_BOOST = 3
 
 
 def turn_end(battle, order):
@@ -978,6 +1089,8 @@ def turn_end(battle, order):
         if b.item == LEFTOVERS and battle.hp[b.id] < battle.full[b.id]:
             raise Unsupported("Leftovers at the turn's end")
         live = callbacks(b) & {"onResidual"}
+        if battle.hp[b.id] and battle.status.get(b.id) and battle.status[b.id][0] not in (BRN, PSN, PAR, FRZ):
+            raise Unsupported(f"battler {b.id}'s status at the turn's end")
         if b.ability == MOODY and battle.hp[b.id]:
             raise Unsupported("Moody at the turn's end")
         if live or battle.field - {"sand"}:
@@ -985,8 +1098,45 @@ def turn_end(battle, order):
     q = queue.encode(0xC5, (0,)) + queue.encode(0x50, (0,))
     if "sand" in battle.field:
         q += sandstorm(battle, order)
-    q += b"".join(queue.encode(0x19, (b, k)) for k in RESIDUALS for b in order if battle.hp[b])
-    return q + b"".join(queue.encode(0x44, (k,)) for k in range(1, 14))
+    for k in RESIDUALS:
+        for b in order:
+            if battle.hp[b]:
+                q += queue.encode(0x19, (b, k)) + residual(battle, b, k)
+    q += b"".join(queue.encode(0x44, (k,)) for k in range(1, 14))
+    for b in order:
+        if battle.hp[b] and battle.b[b].ability == SPEED_BOOST:
+            if battle.stages[b][5] == 6:
+                raise Unsupported("Speed Boost at +6")
+            battle.stages[b][5] += 1                        # Speed Boost: +1 Speed after the turn's end
+            q += queue.encode(0x25, (b,)) + queue.encode(0xC7, (b, 0)) + queue.encode(0x0C, (b, 5, 1))
+            q += queue.encode(0x92, (b, 5, 1, 0)) + message(b, 15, b) + queue.encode(0xC8, (b,))
+    return q
+
+
+def residual(battle, b, kind):
+    """A status's damage at a turn's end, after its kind's 0x19: a burn (kind 4) a sixteenth of the maximum
+    HP, a poison (kind 5) an eighth, a bad poison n sixteenths on its n-th turn end: 0xa7 (position, code),
+    0x01 (b, the battler that inflicted it, damage, 39 or 38), 0x9a (b, -damage), message 88 or 82."""
+    st = battle.status.get(b)
+    if not st or (kind, st[0]) not in ((4, BRN), (5, PSN)):
+        return b""
+    full = battle.b[b].stats[0]                             # the boss's record HP, not its pool
+    if st[0] == BRN:
+        dmg, code, how, text = max(1, full // 16), 44, 39, 88
+    elif st[5]:
+        st[3] += 1
+        dmg, code, how, text = max(1, full // 16) * st[3], 43, 38, 82
+    else:
+        dmg, code, how, text = max(1, full // 8), 43, 38, 82
+    if battle.b[b].ability in (MAGIC_GUARD, 90):                # Magic Guard, Poison Heal
+        raise Unsupported(f"battler {b}'s ability {battle.b[b].ability} against a status's damage")
+    if dmg >= battle.hp[b]:
+        raise Unsupported("a knockout at a turn's end")
+    if b == BOSS and boss_trigger(battle, dmg):
+        raise Unsupported("a boss HP trigger at a turn's end")
+    battle.hp[b] -= dmg
+    q = queue.encode(0xA7, (POSITION[b], code)) + queue.encode(0x01, (b, st[2], dmg, how))
+    return q + queue.encode(0x9A, (b, -dmg & 0xFFFFFFFF)) + message(b, text, b)
 
 
 SAFETY_GOGGLES = 650
