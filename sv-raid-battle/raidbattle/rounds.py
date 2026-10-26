@@ -2249,6 +2249,8 @@ def revive(battle, slot):
     x = battle.b[b]
     if battle.hp[b]:
         raise Unsupported(f"battler {b} revived standing")
+    if x.suppressed:                                        # sent back in, its suppressed ability returns
+        x.ability, x.suppressed = x.suppressed, 0
     if x.ability not in REVIVE_ABILITIES | start.QUIET_ABILITIES | start.QUIET_TOO | {start.OWN_TEMPO, start.INNER_FOCUS}:
         raise Unsupported(f"battler {b}'s ability {x.ability} on its revive")
     if x.item not in start.QUIET_ITEMS:
