@@ -37,7 +37,8 @@ IDLE_ITEMS = frozenset((234, 541))
 IDLE_MOVE_CALLBACKS = {"Facade": {"onBasePower"}, "Venoshock": {"onBasePower"}, "Electro Drift": {"onBasePower"},
                        "Collision Course": {"onBasePower"}, "Expanding Force": {"onBasePower"},
                        "Payback": {"basePowerCallback"}, "Hex": {"basePowerCallback"},
-                       "Rising Voltage": {"basePowerCallback"}}
+                       "Rising Voltage": {"basePowerCallback"}, "Sunsteel Strike": {"ignoreAbility"},
+                       "Moongeist Beam": {"ignoreAbility"}}
 PRESSURE = 46               # a move aimed at it spends 2 PP: 0x05 (b, 0, 2)
 STURDY = 5
 INNER_FOCUS = 39
@@ -48,6 +49,10 @@ SHIELDS_DOWN = 197
 LEVITATE = 26
 ICE_SCALES = 246
 FILTER, SOLID_ROCK, PRISM_ARMOR = 111, 116, 232
+# abilities a mold breaker ignores that change a hit here (Showdown flag breakable): Sturdy, Battle and Shell
+# Armor, Levitate, Thick Fat, Shield Dust, Inner Focus, Own Tempo, Filter, Solid Rock, Ice Scales, Clear Body
+# and kin, Marvel Scale, Sand Veil, Snow Cloak, Tangled Feet, Keen Eye, Hyper Cutter, Big Pecks
+BREAKABLE = frozenset({5, 4, 75, 26, 47, 19, 39, 20, 111, 116, 246, 29, 73, 230, 63, 8, 81, 77, 51, 52, 145})
 TANGLED_FEET, TOXIC_BOOST = 77, 137
 ROCK_HEAD, MAGIC_GUARD = 69, 98
 PINCH = {65: "Grass", 66: "Fire", 67: "Water", 68: "Bug"}
@@ -389,6 +394,8 @@ def use(battle, actor, number, position):
     if position == 10:
         return spread(battle, actor, number, move)
     target = BATTLER_AT[position]
+    if "ignoreAbility" in move["callbacks"] and battle.b[target].ability in BREAKABLE:
+        raise Unsupported("a move ignoring an ability that changes its hit")
     r = battle.rng
     if not battle.hp[target]:
         return immune(battle, actor, target, number, move, position, gone=True)
