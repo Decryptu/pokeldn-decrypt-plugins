@@ -144,7 +144,7 @@ class Battle:
         self.timer_offset = 0                           # seconds the faints took off the battle timer
         self.listed = []                                # battlers revived since the last round (0x23 first)
         self.status = {}                                # battler -> [condition, value, source, toxic count]
-        self.confused = {}                              # battler -> turns of confusion left
+        self.confused = {}                              # battler -> [turns of confusion left, who confused it]
         self.flinched = set()                           # battlers a flinch stops this round
         self.paced = {}                                 # battler -> its 0x51 value this round (Stall's 0)
 
@@ -838,9 +838,11 @@ def confuse(battle, actor, target, turns):
     """Confusion landing: 0x13 (T, 6, 0, turns << 3 | 2, A), 0xa7 (T's position, 47), message 116."""
     if target in battle.confused:
         return b""
+    if battle.b[target].ability == 20 and battle.b[actor].ability not in MOLD_BREAKERS:
+        return b""                                          # Own Tempo: a secondary's confusion fails silently
     if battle.terrain == "Misty" and battle.grounded(target):
         raise Unsupported("confusion in Misty Terrain")
-    battle.confused[target] = turns
+    battle.confused[target] = [turns, actor]
     q = queue.encode(0x13, (target, 6, 0, turns << 3 | 2, actor))
     return q + queue.encode(0xA7, (POSITION[target], 47)) + message(actor, 116, target)
 
@@ -878,8 +880,6 @@ def before_move(battle, e):
     r = battle.rng
     if actor in battle.flinched:
         return message(actor, 122, actor) + queue.encode(0x52, (actor, 0)), False, "flinch"
-    if actor in battle.confused:
-        raise Unsupported("a confused battler moving")
     if st and st[0] in (FRZ, SLP):
         if st[0] == FRZ:
             woke, text = r.chance(20), 99                   # thawed
@@ -892,9 +892,43 @@ def before_move(battle, e):
         q = queue.encode(0x14, (actor,)) + queue.encode(0x90, (actor, 0)) + message(actor, text, actor)
         pre, goes, why = before_move(battle, e)
         return q + pre, goes, why
+    pre = b""
+    if actor in battle.confused:
+        pre, goes = confusion(battle, actor)
+        if not goes:
+            return pre, False, "confusion"
     if st and st[0] == PAR and r.chance(25):
+        if pre:
+            raise Unsupported("a confused battler fully paralysed")
         return stopped(battle, actor, e.move, 93, 46), False, "status"
-    return b"", True, None
+    return pre, True, None
+
+
+def confusion(battle, actor):
+    """Confusion before a move (Showdown conditions.ts): its turns run down, at 0 it ends with 0x15 (A, 6)
+    and message 118 and the move goes on; else 0xa7 (A's position, 47), message 117 and chance(33) to hit
+    itself: a 40-power typeless physical hit at its stat stages, roll below(16), shown as 0x91 (A), 0x01 (A,
+    the battler that confused it, damage, 2), 0x9a (A, -damage), 0xca (A, 576, A), 0x52 (A, 0)."""
+    c, r = battle.confused[actor], battle.rng
+    c[0] -= 1
+    if c[0] <= 0:
+        del battle.confused[actor]
+        return queue.encode(0x15, (actor, 6)) + message(actor, 118, actor), True
+    q = queue.encode(0xA7, (POSITION[actor], 47)) + message(actor, 117, actor)
+    if not r.chance(33):
+        return q, True
+    if actor == BOSS and battle.raid.state == 1:
+        raise Unsupported("the shielded boss hitting itself")
+    b = battle.b[actor]
+    att, dfn = staged(b.stats[1], battle.stages[actor][1]), staged(b.stats[2], battle.stages[actor][2])
+    base = ((2 * b.level // 5 + 2) * 40 * att // dfn // 50 + 2) & 0xFFFF
+    dmg = max(1, base * (100 - r.below(16)) // 100)
+    if dmg >= battle.hp[actor]:
+        raise Unsupported("a confused battler knocking itself out")
+    battle.hp[actor] -= dmg
+    q += queue.encode(0x91, (actor,)) + queue.encode(0x01, (actor, c[1], dmg, 2))
+    q += queue.encode(0x9A, (actor, -dmg & 0xFFFFFFFF)) + queue.encode(0xCA, (actor, 576, actor, END) + (0,) * 6)
+    return q + queue.encode(0x52, (actor, 0)), False
 
 
 def boss_down(battle, actor, number, quiet=False):
@@ -1168,7 +1202,7 @@ def run(battle, e, entries):
         if not goes:
             move = MOVES.get(e.move) or {"type": "Normal"}
             tail = queue.encode(0x5B, (e.actor, e.move)) * 2 + queue.encode(0x1E, (e.actor, 0))
-            if why == "status" and e.actor == BOSS:       # only the boss's stopped move shows 0x1d
+            if why in ("status", "confusion") and e.actor == BOSS:       # only the boss's stopped move shows 0x1d
                 tail = queue.encode(0x1D, (e.actor, e.position, TYPES.index(move["type"]), 0, 0, e.move, e.move)) + tail
             return q + pre + tail
         return q + pre + use(battle, e.actor, e.move, e.position)
@@ -1176,9 +1210,16 @@ def run(battle, e, entries):
         return raid_action(battle, e, entries)
     if e.kind == Entry.RESET:
         return reset(battle, e.value)
-    if e.actor in battle.confused:
-        raise Unsupported("a confused boss's raid move")
-    used = handler(battle, (e.actor, e.move), 0x72000, last=False) + use(battle, e.actor, e.move, e.position)
+    if battle.status.get(e.actor, (0,))[0] == PAR:
+        raise Unsupported("a paralysed boss's raid move")
+    pre, goes = confusion(battle, e.actor) if e.actor in battle.confused else (b"", True)
+    used = handler(battle, (e.actor, e.move), 0x72000, last=False) + pre
+    if goes:
+        used += use(battle, e.actor, e.move, e.position)
+    else:                                                   # it hit itself: the move's end with no hit
+        move = MOVES.get(e.move) or {"type": "Normal"}
+        used += queue.encode(0x1D, (e.actor, e.position, TYPES.index(move["type"]), 0, 0, e.move, e.move))
+        used += queue.encode(0x5B, (e.actor, e.move)) * 2 + queue.encode(0x1E, (e.actor, 0))
     end = queue.encode(0x1E, (e.actor, 0))
     return q + queue.encode(0xC1, (9, 0)) + used[:-len(end)] + queue.encode(0xC1, (9, 1)) + end
 
@@ -1222,6 +1263,8 @@ def raid_action(battle, e, entries):
     if e.sub == raid.SHIELD and battle.status.get(BOSS):
         del battle.status[BOSS]                             # the shield cures the boss's status
         q += queue.encode(0x14, (BOSS,)) + queue.encode(0x90, (BOSS, 0))
+    if e.sub == raid.SHIELD and battle.confused.pop(BOSS, None):
+        q += queue.encode(0x15, (BOSS, 6))                  # and its confusion
     return q
 
 
