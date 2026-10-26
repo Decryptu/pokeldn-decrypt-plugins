@@ -116,6 +116,8 @@ def check_rounds(d):
             m = struct.unpack_from("<I", want, 0x238)[0]
             a, b = queue.decode(got[0x23c:0x23c + struct.unpack_from("<I", got, 0x238)[0]]), queue.decode(want[0x23c:0x23c + m])
             i = next((i for i in range(min(len(a), len(b))) if a[i] != b[i]), min(len(a), len(b)))
+            if os.environ.get("CC_SHOW"):
+                print([(hex(k), v) for k, v in a[max(0, i - 12):i + 6]], "\n", [(hex(k), v) for k, v in b[max(0, i - 12):i + 6]])
             return "different", f"round {rounds_done} command {i}: ours {a[i:i+2]} oracle {b[i:i+2]}"
         rounds_done += 1
     return "equal", f"{rounds_done} rounds"

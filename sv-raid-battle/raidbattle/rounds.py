@@ -41,6 +41,7 @@ CANT_SUPPRESS = frozenset((121, 161, 176, 197, 208, 209, 210, 211, 213, 225, 241
 AIR_BALLOON = 541
 SHIELDS_DOWN = 197
 LEVITATE = 26
+ICE_SCALES = 246
 ROCK_HEAD, MAGIC_GUARD = 69, 98
 PINCH = {65: "Grass", 66: "Fire", 67: "Water", 68: "Bug"}
 HUGE_POWER, PURE_POWER, ADAPTABILITY = 37, 74, 91
@@ -124,7 +125,9 @@ class Battle:
         self.triggers = frozenset()                     # boss HP shares its profile acts at
         self.double = None                              # the double action's HP share (it acts at 0 too)
         self.stages = {i: [0] * 8 for i in battlers}     # stat stages by stat index (1 Atk ... 5 Spe, 6 acc, 7 eva)
-        self.field = set()                              # "sun", "rain", "snow", "sand", "terrain"
+        self.field = set()                              # "sun", "rain", "snow", "sand"
+        self.terrain = None                             # "Grassy", "Misty", "Electric", "Psychic"
+        self.terrain_left = 0                           # turn ends until the terrain ends
         self.weather_left = 0                           # turn ends until the weather ends (0x79's 5)
         self.weather_by = 0                             # the battler that set it (0x01's second argument)
         self.sand_hurt = set()                          # battlers the sandstorm has damaged
@@ -150,6 +153,22 @@ class Battle:
         """The Speed the turn order reads: the stat at its stage, halved while paralysed."""
         spe = staged(self.b[battler].speed, self.stages[battler][5])
         return modify(spe, 0.5) if self.status.get(battler, (0,))[0] == PAR else spe
+
+    def grounded(self, b):
+        """Showdown isGrounded, for the effects a raid can reach: not Flying, Levitate or an Air Balloon."""
+        return "Flying" not in self.defending(b) and self.b[b].ability != LEVITATE and self.b[b].item != AIR_BALLOON
+
+    def terrain_power(self, actor, target, move):
+        """The terrain's onBasePower factor (Showdown conditions.ts): 1.3 for its type from a grounded user,
+        a half for Dragon into a grounded target in Misty Terrain and Earthquake-likes in Grassy Terrain."""
+        t = self.terrain
+        if t and move["type"] == TERRAIN_TYPES[t] and t != "Misty" and self.grounded(actor):
+            return 5325 / 4096
+        if t == "Misty" and move["type"] == "Dragon" and self.grounded(target):
+            return 0.5
+        if t == "Grassy" and move["name"] in ("Earthquake", "Bulldoze") and self.grounded(target):
+            return 0.5
+        return 0
 
     def defending(self, target):
         return [self.tera] if target == BOSS else self.types[target]
@@ -212,6 +231,11 @@ class Battle:
             if boosted:
                 raise Unsupported("Rivalry chained with a type item")
             power = modify(power, 1.25 if a.gender == d.gender else 0.75)     # Showdown abilities.ts
+        terrain = self.terrain_power(actor, target, move)
+        if terrain:
+            if boosted or ability_boost or a.ability == RIVALRY and a.gender < 2 and d.gender < 2:
+                raise Unsupported("a terrain's power chained with another")
+            power = modify(power, terrain)
         power = self.power(actor, move, power)
         base = (2 * a.level // 5 + 2) * power * att // dfn // 50 + 2
         if crit:
@@ -226,6 +250,10 @@ class Battle:
             if a.ability == GUTS or move["name"] == "Facade":
                 raise Unsupported("Guts or Facade while burned")
             x = modify(x, 0.5)                              # Showdown getDamage: a burned user's physical move
+        if d.ability == ICE_SCALES and move["category"] == "Special" and a.ability not in MOLD_BREAKERS:
+            if a.ability == TINTED_LENS and e < 1:
+                raise Unsupported("Tinted Lens chained with Ice Scales")
+            x = modify(x, 0.5)                              # Showdown abilities.ts: Ice Scales, onSourceModifyDamage
         return max(1, x)
 
 
@@ -542,6 +570,8 @@ def status_move(battle, move):
         raise Unsupported(f"{move['name']} is not a Scarlet / Violet move")
     if move["name"] in WEATHER_MOVES and move["callbacks"] == ["weather"]:
         return move
+    if move["name"].split()[0] in TERRAINS and move["callbacks"] == ["condition", "terrain"]:
+        return move
     if move.get("status") in STATUS and not any(k in move for k in ("self", "volatileStatus", "boosts",
                                                                       "secondary", "secondaries")):
         if set(move["callbacks"]) - {"ignoreImmunity"} or move["target"] != "normal":
@@ -549,7 +579,7 @@ def status_move(battle, move):
         return move
     if not move.get("boosts") or any(k in move for k in ("self", "volatileStatus", "status", "secondary",
                                                           "secondaries", "multihit")):
-        raise Unsupported("not a damaging move")
+        raise Unsupported(f"not a damaging move: {move['name']}")
     if set(move["callbacks"]) - ({"onModifyMove"} if move["name"] == "Growth" else set()):
         raise Unsupported(f"{move['name']}'s {move['callbacks'][0]}")
     if move["name"] == "Growth" and battle.field & {"sun"}:
@@ -557,6 +587,47 @@ def status_move(battle, move):
     if move["target"] not in ("self", "normal", "any", "allAdjacentFoes"):
         raise Unsupported(f"target {move['target']}")
     return move
+
+
+# Showdown conditions.ts: a terrain's boosted type; its 0x32 / 0xaa code and start and end messages
+TERRAIN_TYPES = {"Grassy": "Grass", "Misty": "Fairy", "Electric": "Electric", "Psychic": "Psychic"}
+TERRAINS = {"Grassy": (1, 704, 705), "Misty": (2, 706, 707), "Electric": (3, 708, 709), "Psychic": (4, 828, 829)}
+TERRAIN_TURNS = 5
+# abilities and items that read the terrain: Grass Pelt, Surge Surfer, Mimicry, Quark Drive, Hadron Engine;
+# the four seeds and Terrain Extender
+TERRAIN_READERS = frozenset({179, 207, 250, 282, 289})
+TERRAIN_ITEMS = frozenset({881, 882, 883, 884, 896})
+
+
+def terrain_start(battle, name, b):
+    """A terrain raised by battler b: 0x32 (t, 0, 42, b), 0x6a (8), 0xb2 (0), 0xaa (t), 0x69 (8, t), then
+    its start message (0xca) about b."""
+    if battle.terrain:
+        raise Unsupported("a terrain over a terrain")
+    if any(x.ability in TERRAIN_READERS or x.item in TERRAIN_ITEMS for x in battle.b.values()):
+        raise Unsupported("an ability or item reads the terrain")
+    t, text, _ = TERRAINS[name]
+    battle.terrain, battle.terrain_left = name, TERRAIN_TURNS
+    q = queue.encode(0x32, (t, 0, 42, b)) + queue.encode(0x6A, (8,)) + queue.encode(0xB2, (0,))
+    q += queue.encode(0xAA, (t,)) + queue.encode(0x69, (8, t))
+    return q + queue.encode(0xCA, (b, text, END) + (0,) * 7)
+
+
+def terrain_end(battle):
+    """A terrain's fifth turn end, between 0x44 (8) and 0x44 (9): 0x34 (8), 0x6a (8), its end message
+    about battler 0, 0x32 (0, 0, 1, 0), 0x6a (8), 0xb2 (0), 0xaa (0), 0x69 (8, 0)."""
+    if not battle.terrain:
+        return b""
+    battle.terrain_left -= 1
+    if battle.terrain_left:
+        return b""
+    if battle.terrain == "Misty":
+        raise Unsupported("Misty Terrain ends")         # its end message is not in the corpus
+    text = TERRAINS[battle.terrain][2]
+    battle.terrain = None
+    q = queue.encode(0x34, (8,)) + queue.encode(0x6A, (8,)) + queue.encode(0xCA, (0, text, END) + (0,) * 7)
+    q += queue.encode(0x32, (0, 0, 1, 0)) + queue.encode(0x6A, (8,)) + queue.encode(0xB2, (0,))
+    return q + queue.encode(0xAA, (0,)) + queue.encode(0x69, (8, 0))
 
 
 def weather_start(battle, name, w, b):
@@ -574,8 +645,8 @@ def weather_start(battle, name, w, b):
 
 
 def weather_use(battle, actor, number, position, move):
-    """A weather move: no draw, one zero group, the hit record with the field class (10), the weather."""
-    name, w = WEATHER_MOVES[move["name"]]
+    """A weather or terrain move: no draw, one zero group, the hit record with the field class (10), the
+    weather or terrain."""
     apos = POSITION[actor]
     q = b""
     if actor != BOSS:
@@ -587,7 +658,10 @@ def weather_use(battle, actor, number, position, move):
     q += queue.encode(0x7E, (0, 0, 0, 0, 0, 0)) + queue.encode(0x7E, (1, 0, 0, 0, 0, 0))
     q += queue.encode(0x7E, (2, 7, 7, 7, 7, 7))
     q += queue.encode(0x8B, (apos, position, number, TYPES.index(move["type"]), 0, 0, 0, 0, 10, 0))
-    q += weather_start(battle, name, w, actor)
+    if move["name"] in WEATHER_MOVES:
+        q += weather_start(battle, *WEATHER_MOVES[move["name"]], actor)
+    else:
+        q += terrain_start(battle, move["name"].split()[0], actor)
     q += queue.encode(0x7C, ())
     q += pp(battle, 0x08, actor, number)
     q += queue.encode(0x1D, (actor, position, TYPES.index(move["type"]), 1, 0, number, number))
@@ -618,7 +692,7 @@ def status_use(battle, actor, number, position):
     move = status_move(battle, MOVES[number])
     if number in UNSEEN_MOVES:
         raise Unsupported(f"move {number} was never probed")
-    if move["name"] in WEATHER_MOVES:
+    if move["name"] in WEATHER_MOVES or move["name"].split()[0] in TERRAINS:
         return weather_use(battle, actor, number, position, move)
     own = move["target"] == "self"
     target = actor if own else BATTLER_AT[position]
@@ -702,6 +776,8 @@ def inflict(battle, actor, target, name, turns=0):
         return b""
     if battle.b[target].ability in STATUS_GUARDS:
         raise Unsupported(f"battler {target}'s ability {battle.b[target].ability} against a status")
+    if (battle.terrain == "Misty" or battle.terrain == "Electric" and name == "slp") and battle.grounded(target):
+        raise Unsupported("a status the terrain blocks")
     value = TOXIC_VALUE if name == "tox" else turns << 3 | 2 if name == "slp" else 1
     battle.status[target] = [cond, value, actor, 0, turns, name == "tox"]
     q = queue.encode(0x13, (target, cond, 0, value, actor)) + queue.encode(0x90, (target, cond))
@@ -712,6 +788,8 @@ def confuse(battle, actor, target, turns):
     """Confusion landing: 0x13 (T, 6, 0, turns << 3 | 2, A), 0xa7 (T's position, 47), message 116."""
     if target in battle.confused:
         return b""
+    if battle.terrain == "Misty" and battle.grounded(target):
+        raise Unsupported("confusion in Misty Terrain")
     battle.confused[target] = turns
     q = queue.encode(0x13, (target, 6, 0, turns << 3 | 2, actor))
     return q + queue.encode(0xA7, (POSITION[target], 47)) + message(actor, 116, target)
@@ -777,7 +855,7 @@ def boss_down(battle, actor, number, quiet=False):
     q += queue.encode(0x37, (BOSS, 8, 1))
     q += b"".join(queue.encode(c, (BOSS,)) for c in (0x5F, 0x62, 0x6C, 0x5D))
     q += b"".join(queue.encode(0x41, (b, BOSS)) for b in sorted(battle.b) if b != BOSS and battle.hp[b])
-    q += b"".join(queue.encode(0x33, (BOSS, k)) for k in range(14) if k != 8)
+    q += b"".join(queue.encode(0x33, (BOSS, k)) for k in range(14) if k != 8 or battle.terrain)
     return q + queue.encode(0x80, (BOSS,)) + queue.encode(0x29, (BOSS,)) + queue.encode(0x38, (actor,))
 
 
@@ -802,7 +880,7 @@ def player_down(battle, victim, actor, number, quiet=False):
     q += queue.encode(0x37, (victim, 8, 1))
     q += b"".join(queue.encode(c, (victim,)) for c in (0x5F, 0x62, 0x6C, 0x5D))
     q += b"".join(queue.encode(0x41, (b, victim)) for b in sorted(battle.b) if battle.hp[b])
-    q += b"".join(queue.encode(0x33, (victim, k)) for k in range(14) if k != 8)
+    q += b"".join(queue.encode(0x33, (victim, k)) for k in range(14) if k != 8 or battle.terrain)
     q += queue.encode(0x29, (victim,))
     if victim in PENALIZED:
         n = faint_penalty(battle)
@@ -880,6 +958,9 @@ def callbacks(b, battle=None, acts=()):
             live = set()
     if b.ability in (STALL, MYCELIUM_MIGHT):
         live.discard("onFractionalPriority")            # order_key and the 0x51 pass apply them
+    if b.ability == MYCELIUM_MIGHT and not any(a == b.id and (MOVES.get(n) or {}).get("category") == "Status"
+                                               for a, n, p in acts):
+        live.discard("onModifyMove")                    # it ignores abilities for its status moves only
     if b.ability == PRANKSTER:
         live.discard("onModifyPriority")
     if b.ability in PINCH or b.ability in (HUGE_POWER, PURE_POWER):
@@ -1040,6 +1121,8 @@ def run(battle, e, entries):
         return raid_action(battle, e, entries)
     if e.kind == Entry.RESET:
         return reset(battle, e.value)
+    if e.actor in battle.confused:
+        raise Unsupported("a confused boss's raid move")
     used = handler(battle, (e.actor, e.move), 0x72000, last=False) + use(battle, e.actor, e.move, e.position)
     end = queue.encode(0x1E, (e.actor, 0))
     return q + queue.encode(0xC1, (9, 0)) + used[:-len(end)] + queue.encode(0xC1, (9, 1)) + end
@@ -1052,6 +1135,11 @@ def raid_turn(battle, entries):
     if r.pending or not battle.hp[BOSS]:
         return
     r.pending = r.triggers(battle)
+    moves = [(k, v) for k, v in r.pending if k == raid.EXTRA and r.extras[v][0] == raid.MOVE]
+    if moves and battle.status.get(BOSS, (0,))[0] == SLP:
+        raise Unsupported("a sleeping boss's move action")
+    if moves and battle.status.get(BOSS, (0,))[0] == FRZ:     # a frozen boss holds its move actions back
+        r.pending = [x for x in r.pending if x not in moves]
     if r.pending and all(k != raid.SHIELD for k, v in r.pending):
         entries += [Entry(BOSS, Entry.RAID, sub=k, value=v) for k, v in r.pending]
 
@@ -1219,10 +1307,10 @@ WEATHER_TURNS = 5
 
 def weather_check(battle, acts):
     """Sun, rain or snow leave a round unchanged when no move of the round is boosted by it, no battler
-    reads it; sand also raises a Rock type's Special Defense (Battle.damage); terrain is refused."""
-    field = battle.field - {"sun", "rain", "snow", "sand"}
-    if field:
-        raise Unsupported(f"{sorted(field)[0]} on the field")
+    reads it; sand also raises a Rock type's Special Defense (Battle.damage); terrain_check refuses what a
+    terrain changes and nothing here builds."""
+    if battle.terrain:
+        terrain_check(battle, acts)
     if not battle.field:
         return
     if any(WEATHER_ABILITIES.get(b.ability, set()) & battle.field for b in battle.b.values()):
@@ -1235,6 +1323,20 @@ def weather_check(battle, acts):
         if "snow" in battle.field and move["category"] == "Physical" and target and \
                 "Ice" in battle.defending(target):
             raise Unsupported("an Ice-type target in snow")
+
+
+def terrain_check(battle, acts):
+    """Refuses what a terrain changes and nothing here builds: Grassy Terrain's heal, Psychic Terrain
+    stopping a priority move."""
+    if battle.terrain == "Grassy":
+        raise Unsupported("Grassy Terrain")
+    if any(x.ability in TERRAIN_READERS or x.item in TERRAIN_ITEMS for x in battle.b.values()):
+        raise Unsupported("an ability or item reads the terrain")
+    for actor, number, position in acts:
+        target = BATTLER_AT.get(position)
+        if battle.terrain == "Psychic" and priority(battle, actor, number) > 0 and target is not None and \
+                (target == BOSS) != (actor == BOSS) and battle.grounded(target):
+            raise Unsupported("a priority move into Psychic Terrain")
 
 
 TURN = 4                    # a turn ends every fourth command round
@@ -1266,7 +1368,8 @@ def turn_end(battle, order):
         for b in order:
             if battle.hp[b]:
                 q += queue.encode(0x19, (b, k)) + residual(battle, b, k)
-    q += b"".join(queue.encode(0x44, (k,)) for k in range(1, 14))
+    q += b"".join(queue.encode(0x44, (k,)) for k in range(1, 9)) + terrain_end(battle)
+    q += b"".join(queue.encode(0x44, (k,)) for k in range(9, 14))
     for b in order:
         if battle.hp[b] and battle.b[b].ability == SPEED_BOOST:
             if battle.stages[b][5] == 6:

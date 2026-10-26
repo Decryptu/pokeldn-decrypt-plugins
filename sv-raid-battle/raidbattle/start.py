@@ -120,9 +120,10 @@ def weather(b, field):
     return ability_event(b, out + (message(b.id, text, b.id) if text else b""))
 
 
-def terrain(b, field):
+def terrain(b, battle):
     t, text, command = TERRAIN[b.ability]
-    field.add("terrain")
+    if battle is not None:
+        battle.terrain, battle.terrain_left = {2: "Misty", 3: "Electric", 4: "Psychic"}[t], 5
     out = queue.encode(0x32, (t, 0, 42, b.id)) + queue.encode(0x6A, (8,)) + queue.encode(0xB2, (0,))
     out += queue.encode(0xAA, (t,)) + queue.encode(0x69, (8, t))
     out += side_message(b, text) if command == 0xCA else message(b.id, text, b.id)
@@ -271,9 +272,9 @@ def ability_in(b, battlers, stages, battle):
     elif b.ability in WEATHER:
         out += weather(b, field)
         if battle is not None:
-            battle.weather_by = b.id
+            battle.weather_by, battle.weather_left = b.id, 5
     elif b.ability in TERRAIN:
-        out += terrain(b, field)
+        out += terrain(b, battle)
     elif b.ability == SHIELDS_DOWN:
         if b.form >= MINIOR_CORE or 2 * b.hp <= b.stats[0]:
             raise Unsupported(f"battler {b.id}'s Shields Down changes its form")   # Core form: its stats change
