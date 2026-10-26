@@ -690,7 +690,7 @@ def strike(battle, actor, target, number, move, code, i, hits):
                 drops += confuse(battle, actor, target, turns)
                 continue
             if set(sec) == {"chance", "self"} and not knockout:
-                drops += raise_stats(battle, actor, sec["self"]["boosts"])     # Flame Charge and kin: the user
+                drops += raise_stats(battle, actor, sec["self"]["boosts"], secondary=True)     # Flame Charge and kin
                 continue
             if sec.get("volatileStatus") == "saltcure" and not knockout:
                 if target in battle.salted:
@@ -810,7 +810,7 @@ def recoil(battle, actor, move, dmg, knockout):
 def immune(battle, actor, target, number, move, position, missed=False, floor=False, levitate=False, gone=False):
     """A damaging move the target's types are immune to (no draw), or one that missed: five zero groups,
     message 72 and 0x52 (A, 3), or message 73 and 0x52 (A, 1); a stat-dropping move into stats all at -6
-    (`floor`, no draw): message 60 alone; a Ground move into Levitate (no draw): message 72 about the target
+    (`floor`, no draw): message 59 + stat per stat, or on its user's stats all at +6, 52 + stat; a Ground move into Levitate (no draw): message 72 about the target
     inside its ability's activation, 0x25 (T), 0xc7 (T, 0) ... 0xc8 (T); a target fainted since the move was
     aimed (`gone`): 0xca (A, 567) and no 0x08."""
     mtype = TYPES.index(move["type"])
@@ -823,8 +823,9 @@ def immune(battle, actor, target, number, move, position, missed=False, floor=Fa
         q += queue.encode_group(0xCF, bytes(size))
     if gone:
         q += queue.encode(0xCA, (actor, 567, END) + (0,) * 7)
-    elif floor:
-        q += message(actor, 60, target)
+    elif floor:                                             # 59 + stat "won't go lower", 52 + stat "won't go higher"
+        lower = any(d < 0 for d in move["boosts"].values())
+        q += b"".join(message(actor, (59 if lower else 52) + STATS[k], target) for k, d in ordered(move["boosts"]))
     elif levitate:
         q += queue.encode(0x25, (target,)) + queue.encode(0xC7, (target, 0)) + message(target, 72, target)
         q += queue.encode(0xC8, (target,)) + queue.encode(0x52, (actor, 3))
@@ -1011,8 +1012,9 @@ def weather_use(battle, actor, number, position, move):
     return q
 
 
-def raise_stats(battle, b, boosts):
-    """A move's raise of its user's stages: 0x0c, 0x92, then message RAISE_TEXT + stat per stat."""
+def raise_stats(battle, b, boosts, secondary=False):
+    """A move's raise of its user's stages: 0x0c, 0x92, then message RAISE_TEXT + stat per stat; a
+    secondary's raise of a stat at +6 shows nothing."""
     x = battle.b[b]
     if set(ABILITIES.get(str(x.ability), ["unknown"])) & BOOST_ANSWERS or x.item not in (0, *IDLE_ITEMS) and \
             set(ITEMS.get(str(x.item), ["unknown"])) & (BOOST_ANSWERS | {"onUpdate"}):
@@ -1020,6 +1022,8 @@ def raise_stats(battle, b, boosts):
     q = b""
     for key, n in ordered(boosts):
         stat = STATS[key]
+        if secondary and battle.stages[b][stat] == 6:
+            continue
         if n not in RAISE_TEXT or battle.stages[b][stat] + n > 6:
             raise Unsupported("a stat raise past +6 or of more than 3 stages")
         battle.stages[b][stat] += n
@@ -1133,6 +1137,10 @@ def status_use(battle, actor, number, position):
             raise Unsupported("a raise on a foe")
         stat_drop(battle, actor, target, {}, secondary=False)   # what answers a drop still refuses
         return immune(battle, actor, target, number, move, position, floor=True)
+    if own and move.get("boosts") and all(battle.stages[actor][STATS[k]] == 6 for k in move["boosts"]):
+        if any(d <= 0 for d in move["boosts"].values()):
+            raise Unsupported("a self move lowering a stat")
+        return immune(battle, actor, actor, number, move, position, floor=True)
     r = battle.rng
     turns = 2 + r.duration(3) if move.get("status") == "slp" else 0     # drawn before the accuracy, as a secondary's
     if type(move["accuracy"]) is int:
