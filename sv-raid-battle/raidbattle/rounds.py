@@ -378,8 +378,6 @@ def use(battle, actor, number, position):
         if battle.b[actor].ability in MOLD_BREAKERS:
             raise Unsupported("a Ground move into Levitate under Mold Breaker")
         return immune(battle, actor, target, number, move, position, levitate=True)
-    if type(move["accuracy"]) is int and (battle.stages[actor][6] or battle.stages[target][7]):
-        raise Unsupported("an accuracy or evasion stage")
     if type(move["accuracy"]) is int and not r.chance(accuracy(battle, actor, move, target)):
         return immune(battle, actor, target, number, move, position, missed=True)
     hits = move.get("multihit", 1)
@@ -439,10 +437,18 @@ def use(battle, actor, number, position):
 
 
 def accuracy(battle, actor, move, target):
-    """The accuracy a move draws against: Hustle's 3277/4096 on a physical move, Compound Eyes' 5325/4096,
+    """The accuracy a move draws against: its user's accuracy stage less the target's evasion stage (times
+    (3 + n) / 3 raised, 3 / (3 - n) lowered), then Hustle's 3277/4096 on a physical move, Compound Eyes' 5325/4096,
     Sand Veil's or Snow Cloak's 3277/4096 in their weather on the target."""
     acc = move["accuracy"]
     a = battle.b[actor].ability
+    boost = max(-6, min(6, battle.stages[actor][6] - battle.stages[target][7]))
+    if boost and ({a, battle.b[target].ability} & {51, 109, 300} or move["name"] in ("Chip Away", "Sacred Sword", "Darkest Lariat")):
+        raise Unsupported("a stage beside Keen Eye, Unaware, Mind's Eye or a move ignoring evasion")
+    if boost > 0:
+        acc = acc * (3 + boost) // 3                        # Showdown hitStepAccuracy: the stages first
+    elif boost < 0:
+        acc = acc * 3 // (3 - boost)
     evades = EVADE_WEATHER.get(battle.b[target].ability) in battle.field and a not in MOLD_BREAKERS
     if evades and (a == COMPOUND_EYES or a == HUSTLE and move["category"] == "Physical"):
         raise Unsupported("an accuracy ability chained with an evasion ability")
@@ -819,7 +825,7 @@ def raise_stats(battle, b, boosts):
             set(ITEMS.get(str(x.item), ["unknown"])) & (BOOST_ANSWERS | {"onUpdate"}):
         raise Unsupported(f"battler {b}'s ability {x.ability} or item {x.item} answers a stat raise")
     q = b""
-    for key, n in sorted(boosts.items(), key=lambda kv: STATS[kv[0]]):     # in stat order (Coil)
+    for key, n in ordered(boosts):
         stat = STATS[key]
         if n not in RAISE_TEXT or battle.stages[b][stat] + n > 6:
             raise Unsupported("a stat raise past +6 or of more than 3 stages")
@@ -870,8 +876,6 @@ def status_use(battle, actor, number, position):
         return immune(battle, actor, target, number, move, position, floor=True)
     r = battle.rng
     if type(move["accuracy"]) is int:
-        if battle.stages[actor][6] or battle.stages[target][7]:
-            raise Unsupported("an accuracy or evasion stage")
         if not r.chance(accuracy(battle, actor, move, target) if not own else move["accuracy"]):
             raise Unsupported("a miss")
     apos, tpos = POSITION[actor], POSITION[target]
@@ -902,6 +906,15 @@ def status_use(battle, actor, number, position):
 
 
 STATS = {"atk": 1, "def": 2, "spa": 3, "spd": 4, "spe": 5, "accuracy": 6, "evasion": 7}
+def ordered(boosts):
+    """A move's stat changes in the order the game applies them: moves.json sorts them by name, the game keeps
+    Showdown's source order, which is the stat order but for Shift Gear's (Speed, then Attack)."""
+    keys = tuple(sorted(boosts, key=STATS.get))
+    if keys == ("atk", "spe") and boosts == {"atk": 1, "spe": 2}:
+        keys = ("spe", "atk")                               # Shift Gear: Speed first (Showdown's order)
+    elif len(keys) == 5 and len(set(boosts.values())) > 1:
+        raise Unsupported("Shell Smash's stat order")
+    return [(k, boosts[k]) for k in keys]
 BOOST_ANSWERS = {"onTryBoost", "onChangeBoost", "onAfterBoost", "onAfterEachBoost", "onFoeAfterBoost"}
 # Showdown abilities.ts: onTryBoost that blocks only Intimidate, or guards one stat
 INTIMIDATE_ONLY = frozenset({12, 20, 39, 113, 275})        # Oblivious, Own Tempo, Inner Focus, Scrappy, Guard Dog
@@ -917,7 +930,7 @@ def stat_drop(battle, actor, target, boosts):
     if ability & BOOST_ANSWERS or item & (BOOST_ANSWERS | {"onUpdate"}):
         raise Unsupported(f"battler {target}'s ability {b.ability} or item {b.item} answers a stat drop")
     q = b""
-    for key, delta in sorted(boosts.items(), key=lambda kv: STATS[kv[0]]):
+    for key, delta in ordered(boosts):
         stat, n = STATS[key], -delta
         if STAT_GUARD.get(b.ability) == stat:
             raise Unsupported(f"battler {target}'s ability {b.ability} guards stat {stat}")
