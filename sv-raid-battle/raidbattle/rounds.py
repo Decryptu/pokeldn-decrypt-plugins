@@ -1463,9 +1463,10 @@ def round_end(battle, entries, acted, won, counted):
     # a round ends with three battler sorts, the second the 0x43 order; a turn's end with eight, the
     # fourth its residual order, the seventh, after the turn's end, the 0x43 order (a Speed Boost there
     # already counts)
-    ends = [speed_order(battle, standing(battle), battle.speed) for _ in range(3 if won or n != 0 else 5)]
-    if won and len({battle.speed(b) for b in battle.b}) != len(battle.b):
-        raise Unsupported("a speed tie in the winning round")
+    if won:                                                 # the battle is over: no draw, ties in id order
+        ends = [sorted(standing(battle), key=lambda b: -battle.speed(b))] * 3
+    else:
+        ends = [speed_order(battle, standing(battle), battle.speed) for _ in range(3 if n != 0 else 5)]
     q = b""
     if not won:
         q += queue.encode(0xB2, (0,))
