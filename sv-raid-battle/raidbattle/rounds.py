@@ -325,6 +325,11 @@ class Battle:
             if own and late or d.ability == ICE_SCALES:
                 raise Unsupported("an armor ability chained with another")
             x = modify(x, 0.75)                             # Showdown abilities.ts: Filter, Solid Rock, Prism Armor
+        screen = (REFLECT if physical else LIGHT_SCREEN) in self.sides[int(target == BOSS)] and not crit
+        if screen:
+            if own and late or armor or d.ability == ICE_SCALES or a.ability in (TINTED_LENS, 151):
+                raise Unsupported("a screen chained with another modifier, or Infiltrator")
+            x = modify(x, SCREEN_FACTOR[int(target == BOSS)])   # Showdown conditions.ts: Reflect, Light Screen
         if own and late:
             if a.ability == TINTED_LENS and e < 1 or d.ability == ICE_SCALES:
                 raise Unsupported("a move's damage chained with another")
@@ -785,7 +790,7 @@ def status_move(battle, move):
         return move
     if move["name"].split()[0] in TERRAINS and move["callbacks"] == ["condition", "terrain"]:
         return move
-    if move["name"] in ("Tailwind", "Focus Energy", "Stockpile", "Trick Room"):
+    if move["name"] in ("Focus Energy", "Stockpile", "Trick Room") or move["name"] in SIDE_MOVES:
         return move
     if move.get("status") in STATUS and not any(k in move for k in ("self", "volatileStatus", "boosts",
                                                                       "secondary", "secondaries")):
@@ -847,16 +852,19 @@ def terrain_end(battle):
 
 TRICK_ROOM_TOP = 10000      # Showdown getActionSpeed under Trick Room: 10000 - Speed
 TAILWIND = 4                # a side condition's id in 0x4a, 0x4c, 0x4b, 0x66
-SIDE_TURNS = {TAILWIND: 4}
-SIDE_TEXT = {TAILWIND: (643, 645)}      # start, end
+REFLECT, LIGHT_SCREEN, SAFEGUARD = 0, 1, 2
+SCREEN_FACTOR = {0: 2732 / 4096, 1: 2732 / 4096}           # by side: Showdown's factor beside several battlers
+SIDE_TURNS = {TAILWIND: 4, REFLECT: 5, LIGHT_SCREEN: 5, SAFEGUARD: 5}
+SIDE_TEXT = {TAILWIND: (643, 645), REFLECT: (623, 625), LIGHT_SCREEN: (627, 629), SAFEGUARD: (635, 637)}  # start, end
+SIDE_MOVES = {"Tailwind": TAILWIND, "Reflect": REFLECT, "Light Screen": LIGHT_SCREEN, "Safeguard": SAFEGUARD}
 
 
 WIND_RIDER, WIND_POWER = 274, 277
 
 
 def side_start(battle, b, cond):
-    """A side condition raised by battler b on its side: 0x4a and 0x65 (side, cond, 0, 34, b), 0xca (b, start
-    text, side)."""
+    """A side condition raised by battler b on its side: 0x4a and 0x65 (side, cond, 0, turns << 3 | 2, b), 0xca
+    (b, start text, side)."""
     side = int(b == BOSS)
     mine = [i for i in sorted(battle.b) if int(i == BOSS) == side and battle.hp[i]]
     if cond == TAILWIND and any(battle.b[i].ability == WIND_RIDER for i in mine):
@@ -864,7 +872,8 @@ def side_start(battle, b, cond):
     if cond in battle.sides[side]:
         raise Unsupported("a side condition already up")
     battle.sides[side][cond] = [SIDE_TURNS[cond], b]
-    q = queue.encode(0x4A, (side, cond, 0, 34, b)) + queue.encode(0x65, (side, cond, 0, 34, b))
+    turns = SIDE_TURNS[cond] << 3 | 2
+    q = queue.encode(0x4A, (side, cond, 0, turns, b)) + queue.encode(0x65, (side, cond, 0, turns, b))
     q += queue.encode(0xCA, (b, SIDE_TEXT[cond][0], side, END) + (0,) * 6)
     for i in mine if cond == TAILWIND else ():
         if battle.b[i].ability == WIND_POWER:               # charged by its side's Tailwind: condition 20
@@ -920,10 +929,10 @@ def weather_use(battle, actor, number, position, move):
     q += queue.encode_group(0xCF, bytes(20))
     q += queue.encode(0x7E, (0, 0, 0, 0, 0, 0)) + queue.encode(0x7E, (1, 0, 0, 0, 0, 0))
     q += queue.encode(0x7E, (2, 7, 7, 7, 7, 7))
-    side = move["name"] == "Tailwind"
+    side = move["name"] in SIDE_MOVES
     q += queue.encode(0x8B, (apos, 10, number, TYPES.index(move["type"]), 0, 0, 0, 0, 12 if side else 10, 0))
     if side:
-        q += side_start(battle, actor, TAILWIND)
+        q += side_start(battle, actor, SIDE_MOVES[move["name"]])
     elif move["name"] == "Trick Room":                      # field slot 1 for five turns: 0x69 (1, 0), 0x30 (1, 0, 42, A), message 275
         if battle.trick_left:
             raise Unsupported("Trick Room again")
@@ -1036,7 +1045,7 @@ def status_use(battle, actor, number, position):
     move = status_move(battle, MOVES[number])
     if number in UNSEEN_MOVES:
         raise Unsupported(f"move {number} was never probed")
-    if move["name"] in WEATHER_MOVES or move["name"].split()[0] in TERRAINS or move["name"] in ("Tailwind", "Trick Room"):
+    if move["name"] in WEATHER_MOVES or move["name"].split()[0] in TERRAINS or move["name"] in SIDE_MOVES or move["name"] == "Trick Room":
         return weather_use(battle, actor, number, position, move)
     if position == 10 and move["target"] == "allAdjacentFoes":
         return spread_status(battle, actor, number, move)
@@ -1162,6 +1171,8 @@ def inflict(battle, actor, target, name, turns=0):
         return b""
     if battle.b[target].ability in STATUS_GUARDS:
         raise Unsupported(f"battler {target}'s ability {battle.b[target].ability} against a status")
+    if SAFEGUARD in battle.sides[int(target == BOSS)] and actor != target:
+        raise Unsupported("a status into Safeguard")
     if battle.b[target].ability == SYNCHRONIZE and (actor == BOSS) != (target == BOSS) and name != "slp":
         raise Unsupported("Synchronize")
     if name == "frz" and "sun" in battle.field:
@@ -1180,6 +1191,8 @@ def confuse(battle, actor, target, turns):
         return b""
     if battle.b[target].ability == 20 and battle.b[actor].ability not in MOLD_BREAKERS:
         return b""                                          # Own Tempo: a secondary's confusion fails silently
+    if SAFEGUARD in battle.sides[int(target == BOSS)]:
+        raise Unsupported("confusion into Safeguard")
     if battle.terrain == "Misty" and battle.grounded(target):
         raise Unsupported("confusion in Misty Terrain")
     battle.confused[target] = [turns, actor]
