@@ -38,7 +38,7 @@ IDLE_MOVE_CALLBACKS = {"Facade": {"onBasePower"}, "Venoshock": {"onBasePower"}, 
                        "Collision Course": {"onBasePower"}, "Expanding Force": {"onBasePower"},
                        "Payback": {"basePowerCallback"}, "Hex": {"basePowerCallback"},
                        "Rising Voltage": {"basePowerCallback"}, "Sunsteel Strike": {"ignoreAbility"},
-                       "Moongeist Beam": {"ignoreAbility"}}
+                       "Moongeist Beam": {"ignoreAbility"}, "Salt Cure": {"condition"}}
 PRESSURE = 46               # a move aimed at it spends 2 PP: 0x05 (b, 0, 2)
 STURDY = 5
 INNER_FOCUS = 39
@@ -151,6 +151,7 @@ class Battle:
         self.charged = set()
         self.spent = {}
         self.focused = set()
+        self.salted = {}                                # battler -> the battler whose Salt Cure hit it
         self.trick_left = 0                             # turn ends until Trick Room ends
         self.stockpile = collections.Counter()          # battler -> Stockpile layers                            # battlers under Focus Energy
         self.spreading = False                          # a spread move's hits are being computed
@@ -645,6 +646,12 @@ def strike(battle, actor, target, number, move, code, i, hits):
                 continue
             if sec.get("volatileStatus") == "confusion" and set(sec) == {"chance", "volatileStatus"} and not knockout:
                 drops += confuse(battle, actor, target, turns)
+                continue
+            if sec.get("volatileStatus") == "saltcure" and not knockout:
+                if target in battle.salted:
+                    raise Unsupported("Salt Cure on a salted target")
+                battle.salted[target] = actor                   # condition 46 until it faints
+                drops += queue.encode(0x13, (target, 46, 0, 1, actor)) + message(actor, 1033, target, actor)
                 continue
             if set(sec) != {"chance", "boosts"} or knockout:
                 raise Unsupported("a secondary effect")
@@ -1324,6 +1331,7 @@ def player_down(battle, victim, actor, number, quiet=False):
     battle.confused.pop(victim, None)
     battle.charged.discard(victim)
     battle.focused.discard(victim)
+    battle.salted.pop(victim, None)
     battle.stockpile.pop(victim, None)
     for e in battle.entries:
         if e.actor == victim:
@@ -1906,10 +1914,28 @@ def residual_idle(battle, b):
     return False
 
 
+def salt(battle, b):
+    """Salt Cure's damage at residual kind 46: an eighth of the record HP (a quarter for Water or Steel), at
+    least 1: 0xa7 (b's position, 152), 0x01 (b, the salter, damage, 0), 0x9a, message 125 (b, 864)."""
+    full = battle.b[b].stats[0]
+    dmg = max(1, full // (4 if {"Water", "Steel"} & set(battle.defending(b)) else 8))
+    if battle.b[b].ability == MAGIC_GUARD:
+        raise Unsupported("Magic Guard against Salt Cure")
+    if dmg >= battle.hp[b]:
+        raise Unsupported("a knockout at a turn's end")
+    if b == BOSS and boss_trigger(battle, dmg):
+        raise Unsupported("a boss HP trigger at a turn's end")
+    battle.hp[b] -= dmg
+    q = queue.encode(0xA7, (POSITION[b], 152)) + queue.encode(0x01, (b, battle.salted[b], dmg, 0))
+    return q + queue.encode(0x9A, (b, -dmg & 0xFFFFFFFF)) + message(b, 125, b, 864)
+
+
 def residual(battle, b, kind):
     """A status's damage at a turn's end, after its kind's 0x19: a burn (kind 4) a sixteenth of the maximum
     HP, a poison (kind 5) an eighth, a bad poison n sixteenths on its n-th turn end: 0xa7 (position, code),
     0x01 (b, the battler that inflicted it, damage, 39 or 38), 0x9a (b, -damage), message 88 or 82."""
+    if kind == 46 and b in battle.salted:
+        return salt(battle, b)
     st = battle.status.get(b)
     if not st or (kind, st[0]) not in ((4, BRN), (5, PSN)):
         return b""
