@@ -1497,6 +1497,7 @@ TURN = 4                    # a turn ends every fourth command round
 RESIDUALS = (36, 21, 18, 5, 4, 9, 10, 8, 46, 43, 48, 11, 12, 23, 13, 31, 33, 15, 19, 29, 30, 38, 37, 39, 40, 41,
              24, 45, 14, 20, 1, 2, 3, 7, 6, 16, 17, 22, 25, 26, 27, 28, 32, 34, 35)
 LEFTOVERS = 234
+UNNERVE_ID = 127
 MOODY = 141                 # idle in a round, acts at a turn's end
 SPEED_BOOST = 3
 
@@ -1505,8 +1506,6 @@ def turn_end(battle, order):
     """A turn's end with nothing to resolve: 0xc5 (0), 0x50 (0), 0x19 (b, kind) for each residual kind
     over the battlers in `order` (speed order), 0x44 (1 to 13)."""
     for b in battle.b.values():
-        if b.item == LEFTOVERS and battle.hp[b.id] < battle.full[b.id]:
-            raise Unsupported("Leftovers at the turn's end")
         live = callbacks(b, battle) & {"onResidual"}
         if live and residual_idle(battle, b):
             live = set()
@@ -1519,6 +1518,7 @@ def turn_end(battle, order):
     q = queue.encode(0xC5, (0,)) + queue.encode(0x50, (0,)) + weather_end(battle)
     if "sand" in battle.field:
         q += sandstorm(battle, order)
+    q += leftovers(battle, order)
     for k in RESIDUALS:
         for b in order:
             if battle.hp[b]:
@@ -1534,6 +1534,24 @@ def turn_end(battle, order):
             battle.stages[b][5] += 1                        # Speed Boost: +1 Speed after the turn's end
             q += queue.encode(0x25, (b,)) + queue.encode(0xC7, (b, 0)) + queue.encode(0x0C, (b, 5, 1))
             q += queue.encode(0x92, (b, 5, 1, 0)) + message(b, 15, b) + queue.encode(0xC8, (b,))
+    return q
+
+
+def leftovers(battle, order):
+    """Leftovers at a turn's end, before the residual kinds, in speed order: a sixteenth of the record HP,
+    at least 1, to a holder below its maximum: a 5-byte zero group, 0x9b (b, 0), a 3-byte zero group, 0xa7
+    (b's position, 51), 0x03 (b, heal), 0x9a (b, heal), 0xcb (b, 295, b, 234)."""
+    q = b""
+    for b in order:
+        if battle.b[b].item != LEFTOVERS or not battle.hp[b] or battle.hp[b] >= battle.full[b]:
+            continue
+        if battle.b[b].ability in (UNNERVE_ID, 82, 247):                    # Unnerve, Gluttony, Ripen
+            raise Unsupported(f"battler {b}'s ability beside its Leftovers")
+        heal = max(1, battle.b[b].stats[0] // 16)           # shown whole, though the HP stops at the maximum
+        battle.hp[b] = min(battle.full[b], battle.hp[b] + heal)
+        q += queue.encode_group(0xCF, bytes(5)) + queue.encode(0x9B, (b, 0)) + queue.encode_group(0xCF, bytes(3))
+        q += queue.encode(0xA7, (POSITION[b], 51)) + queue.encode(0x03, (b, heal)) + queue.encode(0x9A, (b, heal))
+        q += message(b, 295, b, LEFTOVERS)
     return q
 
 
