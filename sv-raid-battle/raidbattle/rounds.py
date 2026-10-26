@@ -95,6 +95,8 @@ CUTE_CHARM = 56                                 # draws only between a male and 
 MOLD_BREAKERS = frozenset((104, 163, 164))      # Mold Breaker, Turboblaze, Teravolt: Inner Focus ignored
 POISON_TOUCH = 143                              # the attacker's
 CONTACT_STATUSES = {9: "par", 38: "psn", 49: "brn"}
+ROUGH_SKIN = frozenset({24, 160})                  # Rough Skin, Iron Barbs: an eighth of the attacker's maximum HP
+GOOEY = frozenset({183, 221})                      # Gooey, Tangling Hair: the attacker's Speed down one
 RATTLED = 155                                   # +1 Speed, hit by a Bug, Dark or Ghost move
 STALL = 100                 # moves last in its bracket; 0x51 (b, 0) in the speed pass
 PRANKSTER, MYCELIUM_MIGHT = 158, 298
@@ -735,7 +737,7 @@ def strike(battle, actor, target, number, move, code, i, hits):
             if set(sec) != {"chance", "boosts"} or knockout:
                 raise Unsupported("a secondary effect")
             drops += stat_drop(battle, actor, target, sec["boosts"])
-    contact = b""
+    contact, rough = b"", 0
     attract = battle.b[target].ability != CUTE_CHARM or battle.b[actor].gender + battle.b[target].gender == 1
     if "contact" in move["flags"] and not knockout and (battle.b[target].ability in CONTACT_STATUS and attract or
                                                         battle.b[actor].ability == POISON_TOUCH):
@@ -745,6 +747,20 @@ def strike(battle, actor, target, number, move, code, i, hits):
             landed = inflict(battle, target, actor, CONTACT_STATUSES[battle.b[target].ability])
             if landed:                                      # inside the target's ability activation
                 contact = queue.encode(0x25, (target,)) + queue.encode(0xC7, (target, 0)) + landed + queue.encode(0xC8, (target,))
+    if "contact" in move["flags"] and battle.b[target].ability in ROUGH_SKIN | GOOEY \
+            and battle.b[actor].ability not in (MAGIC_GUARD, *CLEAR_BODIES):
+        if contact or (faint or knockout) and battle.b[target].ability in GOOEY:
+            raise Unsupported("a contact answer beside another, or Gooey from a fainted holder")
+        if battle.b[target].ability in ROUGH_SKIN:
+            hurt = max(1, battle.full[actor] // 8)
+            if hurt >= battle.hp[actor]:
+                raise Unsupported("Rough Skin knocking its attacker out")
+            rough = hurt                                    # taken after a drain heal reads the HP
+            landed = queue.encode(0x01, (actor, target, hurt, 20)) + queue.encode(0x9A, (actor, -hurt & 0xFFFFFFFF))
+            landed += message(actor, 143, actor)
+        else:
+            landed = stat_drop(battle, target, actor, {"spe": -1}, secondary=False)
+        contact = queue.encode(0x25, (target,)) + queue.encode(0xC7, (target, 0)) + landed + queue.encode(0xC8, (target,))
     battle.hp[target] -= dmg
     mtype, cat = TYPES.index(move["type"]), 1 if move["category"] == "Physical" else 2
     apos, tpos = POSITION[actor], POSITION[target]
@@ -803,14 +819,15 @@ def strike(battle, actor, target, number, move, code, i, hits):
             raise Unsupported("a self drop beside secondaries")     # their draw order is unmeasured
         r.chance(100)                                       # drawn as a secondary's chance
         drops = stat_drop(battle, actor, actor, move["self"]["boosts"], secondary=False, own=True) + drops
-    q += drops + contact + spit
-    if "drain" in move:
+    if "drain" in move:                                     # in the damage step: before the secondaries and contact
         n, d = move["drain"]
         heal = int(dmg * n / d + 0.5)                       # the commands carry it uncapped
         if battle.hp[actor] < battle.full[actor] and heal > 0:
             battle.hp[actor] = min(battle.full[actor], battle.hp[actor] + heal)
             q += queue.encode(0xA7, (POSITION[actor], 51)) + queue.encode(0x03, (actor, heal))
             q += queue.encode(0x9A, (actor, heal)) + message(actor, 290, target)
+    q += drops + contact + spit
+    battle.hp[actor] -= rough
     if knockout:
         q += boss_down(battle, actor, number, quiet=multi)
     elif faint:
@@ -1554,6 +1571,8 @@ def callbacks(b, battle=None, acts=()):
         live.discard("onSourceModifyDamage")            # Battle.damage applies them
     if b.ability in ABSORB:
         live = set()                                    # use() absorbs a damaging move; status_use refuses one
+    if b.ability in ROUGH_SKIN | GOOEY:
+        live -= {"onDamagingHit"}                       # strike() answers a contact
     if b.ability == PURIFYING_SALT:
         live -= {"onSourceModifyAtk", "onSourceModifySpA", "onSetStatus"}   # Battle.damage and inflict apply them
     if b.ability == TANGLED_FEET and b.id in getattr(battle, "confused", {}):
