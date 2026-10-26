@@ -1398,8 +1398,6 @@ def raid_action(battle, e, entries):
         else:
             raise Unsupported(f"raid action {action}")
         return q
-    if e.sub == raid.DOUBLE:
-        raise Unsupported("the double action")
     x = 0 if e.sub == raid.LOW_TIME else e.value
     q = queue.encode(0x85, (e.sub, x)) + queue.encode(0xC1, (e.sub, x))
     if e.sub == raid.SHIELD and battle.status.get(BOSS):
@@ -1494,8 +1492,6 @@ def build(battle, slot, command):
     acts = actions(command)
     if any(b.transformed for b in battle.b.values()):
         raise Unsupported("a transformed battler")       # its copied stats, moves and types are not built
-    if battle.raid.double:
-        raise Unsupported("the boss acting twice")
     weather_check(battle, acts)
     involved = {a[0] for a in acts} | {BATTLER_AT[a[2]] for a in acts if a[2] in BATTLER_AT}
     for b in battle.b.values():
@@ -1519,8 +1515,6 @@ def build(battle, slot, command):
 def raid_round(battle, words):
     """-> (the body of a raid action round for the queued actions `words` [(kind, value)], whether it wins):
     the actions in slot 1's block (pokeldn docs/sv_raid.md, The boss's actions)."""
-    if battle.raid.double:
-        raise Unsupported("the boss acting twice")
     entries = [Entry(BOSS, Entry.RAID, sub=k, value=v) for k, v in words]
     block = bytearray(0x238)
     for i, (k, v) in enumerate(words):
