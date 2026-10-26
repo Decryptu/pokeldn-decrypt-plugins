@@ -695,7 +695,7 @@ def strike(battle, actor, target, number, move, code, i, hits):
     if move["name"] == "Fell Stinger" and (knockout or faint):
         raise Unsupported("Fell Stinger's knockout")
     rattled = battle.b[target].ability == RATTLED and move["type"] in ("Bug", "Dark", "Ghost")
-    if faint and (rattled or battle.b[target].ability == SAND_SPIT and "sand" not in battle.field):
+    if faint and rattled:
         raise Unsupported(f"a knockout beside an item or ability that answers the hit: {battle.b[target].item} {battle.b[target].ability}")
     if knockout or faint:
         r.chance(0)                                         # drawn by every hit that knocks a battler out
@@ -805,7 +805,7 @@ def strike(battle, actor, target, number, move, code, i, hits):
     q += queue.encode(0x42, (target, actor, apos, mtype, cat, number, dmg))
     spit = b""
     if battle.b[target].ability == SAND_SPIT:
-        if (knockout or battle.b[target].item in (AIR_BALLOON, SMOOTH_ROCK)) and "sand" not in battle.field:
+        if battle.b[target].item in (AIR_BALLOON, SMOOTH_ROCK) and "sand" not in battle.field:
             raise Unsupported("Sand Spit beside another effect")
         spit = sand_spit(battle, target)                    # after the secondaries' commands
     if battle.b[target].item == AIR_BALLOON and not (target == BOSS and knockout):
