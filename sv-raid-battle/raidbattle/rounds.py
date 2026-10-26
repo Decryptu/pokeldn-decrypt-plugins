@@ -49,6 +49,11 @@ FOCUS_SASH = 275
 RIVALRY = 79
 SAND_SPIT, SMOOTH_ROCK = 245, 283
 # Showdown: moves whose power, effect or accuracy sandstorm changes
+# Showdown abilities.ts: onModifySpe doubling in a weather; onModifyAccuracy lowering a move's accuracy
+SPEED_WEATHER = {33: "rain", 34: "sun", 146: "sand", 202: "snow"}
+EVADE_WEATHER = {8: "sand", 81: "snow"}
+WEATHER_HANDLED = frozenset(SPEED_WEATHER) | frozenset(EVADE_WEATHER)
+SAND_IMMUNE = frozenset({8, 142, 146, 159})                     # Sand Veil, Overcoat, Sand Rush, Sand Force
 SAND_MOVES = frozenset({"Weather Ball", "Solar Beam", "Solar Blade", "Shore Up", "Synthesis", "Moonlight",
                         "Morning Sun"})
 TYPE_BOOSTS = _data("type_boosts.json")
@@ -150,9 +155,14 @@ class Battle:
         return moves.index(number) if number in moves else None if battler == BOSS else 0
 
     def speed(self, battler):
-        """The Speed the turn order reads: the stat at its stage, halved while paralysed."""
+        """The Speed the turn order reads: the stat at its stage, doubled by a weather's speed ability (Swift
+        Swim, Chlorophyll, Sand Rush, Slush Rush), halved while paralysed."""
         spe = staged(self.b[battler].speed, self.stages[battler][5])
-        return modify(spe, 0.5) if self.status.get(battler, (0,))[0] == PAR else spe
+        rush = SPEED_WEATHER.get(self.b[battler].ability) in self.field
+        paralysed = self.status.get(battler, (0,))[0] == PAR
+        if rush and paralysed:
+            raise Unsupported("a weather's speed ability chained with paralysis")
+        return modify(spe, 2) if rush else modify(spe, 0.5) if paralysed else spe
 
     def grounded(self, b):
         """Showdown isGrounded, for the effects a raid can reach: not Flying, Levitate or an Air Balloon."""
@@ -238,6 +248,9 @@ class Battle:
             power = modify(power, terrain)
         power = self.power(actor, move, power)
         base = (2 * a.level // 5 + 2) * power * att // dfn // 50 + 2
+        if move["type"] in ("Fire", "Water") and self.field & {"sun", "rain"}:
+            strong = ("sun" in self.field) == (move["type"] == "Fire")
+            base = modify(base, 1.5 if strong else 0.5)     # Showdown conditions.ts: onWeatherModifyDamage
         if crit:
             base = modify(base, 1.5)
         x = base * (100 - roll) // 100
@@ -316,7 +329,7 @@ def use(battle, actor, number, position):
         return immune(battle, actor, target, number, move, position, levitate=True)
     if type(move["accuracy"]) is int and (battle.stages[actor][6] or battle.stages[target][7]):
         raise Unsupported("an accuracy or evasion stage")
-    if type(move["accuracy"]) is int and not r.chance(accuracy(battle, actor, move)):
+    if type(move["accuracy"]) is int and not r.chance(accuracy(battle, actor, move, target)):
         return immune(battle, actor, target, number, move, position, missed=True)
     hits = move.get("multihit", 1)
     if hits == [2, 5]:
@@ -372,14 +385,20 @@ def use(battle, actor, number, position):
     return q
 
 
-def accuracy(battle, actor, move):
-    """The accuracy a move draws against: Hustle's 3277/4096 on a physical move, Compound Eyes' 5325/4096."""
+def accuracy(battle, actor, move, target):
+    """The accuracy a move draws against: Hustle's 3277/4096 on a physical move, Compound Eyes' 5325/4096,
+    Sand Veil's or Snow Cloak's 3277/4096 in their weather on the target."""
     acc = move["accuracy"]
     a = battle.b[actor].ability
+    evades = EVADE_WEATHER.get(battle.b[target].ability) in battle.field and a not in MOLD_BREAKERS
+    if evades and (a == COMPOUND_EYES or a == HUSTLE and move["category"] == "Physical"):
+        raise Unsupported("an accuracy ability chained with an evasion ability")
     if a == HUSTLE and move["category"] == "Physical":
         acc = modify(acc, 3277 / 4096)
     elif a == COMPOUND_EYES:
         acc = modify(acc, 5325 / 4096)
+    elif evades:
+        acc = modify(acc, 3277 / 4096)
     return min(acc, 100)
 
 
@@ -520,7 +539,7 @@ def sand_spit(battle, b):
     the start weather's commands and no message."""
     if battle.field & {"sun", "rain", "snow", "sand"}:
         raise Unsupported("Sand Spit with a weather up")
-    if any(WEATHER_ABILITIES.get(x.ability, set()) & {"sand"} for x in battle.b.values()):
+    if any(WEATHER_ABILITIES.get(x.ability, set()) & {"sand"} for x in battle.b.values() if x.ability not in WEATHER_HANDLED):
         raise Unsupported("an ability reads the weather")
     battle.field.add("sand")
     battle.weather_left, battle.weather_by = WEATHER_TURNS, b
@@ -644,7 +663,7 @@ def weather_start(battle, name, w, b):
     """A weather raised by battler b: 0x6a (0), 0x69 (0, w), 0x79 (w, 5, 0, b, 0), 0x88 (w, b, 0)."""
     if battle.field & {"sun", "rain", "snow", "sand"}:
         raise Unsupported("a weather over another")
-    if any(WEATHER_ABILITIES.get(x.ability, set()) & {name} for x in battle.b.values()):
+    if any(WEATHER_ABILITIES.get(x.ability, set()) & {name} for x in battle.b.values() if x.ability not in WEATHER_HANDLED):
         raise Unsupported("an ability reads the weather")
     if battle.b[b].item in (SMOOTH_ROCK, 284, 285, 259):         # Smooth Rock, Heat Rock, Damp Rock, Icy Rock
         raise Unsupported("a weather rock")
@@ -740,7 +759,7 @@ def status_use(battle, actor, number, position):
     if type(move["accuracy"]) is int:
         if battle.stages[actor][6] or battle.stages[target][7]:
             raise Unsupported("an accuracy or evasion stage")
-        if not r.chance(move["accuracy"]):
+        if not r.chance(accuracy(battle, actor, move, target) if not own else move["accuracy"]):
             raise Unsupported("a miss")
     apos, tpos = POSITION[actor], POSITION[target]
     q = b""
@@ -805,6 +824,8 @@ def inflict(battle, actor, target, name, turns=0):
         return b""
     if battle.b[target].ability in STATUS_GUARDS:
         raise Unsupported(f"battler {target}'s ability {battle.b[target].ability} against a status")
+    if name == "frz" and "sun" in battle.field:
+        raise Unsupported("a freeze in the sun")
     if (battle.terrain == "Misty" or battle.terrain == "Electric" and name == "slp") and battle.grounded(target):
         raise Unsupported("a status the terrain blocks")
     value = TOXIC_VALUE if name == "tox" else turns << 3 | 2 if name == "slp" else 1
@@ -1346,12 +1367,10 @@ def weather_check(battle, acts):
         terrain_check(battle, acts)
     if not battle.field:
         return
-    if any(WEATHER_ABILITIES.get(b.ability, set()) & battle.field for b in battle.b.values()):
+    if any(WEATHER_ABILITIES.get(b.ability, set()) & battle.field for b in battle.b.values() if b.ability not in WEATHER_HANDLED):
         raise Unsupported("an ability reads the weather")
     for actor, number, position in acts:
         move = MOVES.get(number) or {"type": "", "category": ""}
-        if move["type"] in ("Fire", "Water") and battle.field & {"sun", "rain"}:
-            raise Unsupported("a move the weather changes")
         target = BATTLER_AT.get(position)
         if "snow" in battle.field and move["category"] == "Physical" and target and \
                 "Ice" in battle.defending(target):
@@ -1464,6 +1483,8 @@ def sandstorm(battle, order):
     for i in order:
         b = battle.b[i]
         if not battle.hp[i] or set(battle.defending(i)) & {"Rock", "Ground", "Steel"} or b.item == SAFETY_GOGGLES:
+            continue
+        if b.ability in SAND_IMMUNE:
             continue
         if b.ability in (MAGIC_GUARD, SHIELDS_DOWN) or b.ability in PINCH:
             raise Unsupported(f"battler {i}'s ability {b.ability} in the sandstorm")
