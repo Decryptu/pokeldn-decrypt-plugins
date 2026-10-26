@@ -41,6 +41,7 @@ IDLE_MOVE_CALLBACKS = {"Facade": {"onBasePower"}, "Venoshock": {"onBasePower"}, 
                        "Moongeist Beam": {"ignoreAbility"}, "Salt Cure": {"condition"},
                        "False Swipe": {"onDamage", "onDamagePriority"}, "Secret Sword": {"overrideDefensiveStat"},
                        "Psyshock": {"overrideDefensiveStat"}, "Psystrike": {"overrideDefensiveStat"},
+                       "Steel Beam": {"onMoveFail"},
                        "Chip Away": {"ignoreDefensive", "ignoreEvasion"}, "Sacred Sword": {"ignoreDefensive", "ignoreEvasion"},
                        "Darkest Lariat": {"ignoreDefensive", "ignoreEvasion"}}
 # moves whose own callback does nothing in the round at hand (Showdown moves.ts): use() refuses the others
@@ -53,6 +54,10 @@ IDLE_WHEN = {
     "Psychic Fangs": lambda b, a, t: not {REFLECT, LIGHT_SCREEN} & set(b.sides[int(t == BOSS)]),
     "Knock Off": lambda b, a, t: not b.b[t].item, "Grassy Glide": lambda b, a, t: b.terrain != "Grassy",
     "Scorching Sands": lambda b, a, t: b.status.get(t, (0,))[0] != FRZ, "Fell Stinger": lambda b, a, t: True,
+    "Scald": lambda b, a, t: b.status.get(t, (0,))[0] != FRZ, 
+    "Covet": lambda b, a, t: not b.b[t].item, "Thief": lambda b, a, t: not b.b[t].item,
+    "Frost Breath": lambda b, a, t: True, "Wicked Blow": lambda b, a, t: True, "Flower Trick": lambda b, a, t: True,
+    "Surging Strikes": lambda b, a, t: True,
 }
 PRESSURE = 46               # a move aimed at it spends 2 PP: 0x05 (b, 0, 2)
 STURDY = 5
@@ -289,6 +294,8 @@ class Battle:
         dfn = staged(d.stats[2] if hits_def else d.stats[5], dst)
         if not hits_def and "sand" in self.field and "Rock" in self.defending(target):
             dfn = modify(dfn, 1.5)                          # Showdown conditions.ts: sandstorm's onModifySpD
+        if hits_def and "snow" in self.field and "Ice" in self.defending(target):
+            dfn = modify(dfn, 1.5)                          # Showdown conditions.ts: snow's onModifyDef
         if a.ability in PINCH and move["type"] == PINCH[a.ability] and self.hp[actor] * 3 <= self.full[actor]:
             att = modify(att, 1.5)                          # Showdown: Overgrow, Blaze, Torrent, Swarm
         if a.ability in (HUGE_POWER, PURE_POWER) and physical:
@@ -407,7 +414,10 @@ def plain(move):
 
 
 def secondaries(move):
-    return move.get("secondaries") or ([move["secondary"]] if move.get("secondary") else [])
+    """A move's secondary effects in the game's order: Showdown lists the Fangs' status before their flinch,
+    the game draws the flinch first."""
+    secs = move.get("secondaries") or ([move["secondary"]] if move.get("secondary") else [])
+    return sorted(secs, key=lambda x: x.get("volatileStatus") != "flinch") if len(secs) > 1 else secs
 
 
 def use(battle, actor, number, position):
@@ -443,6 +453,8 @@ def use(battle, actor, number, position):
             raise Unsupported("a Ground move into Levitate under Mold Breaker")
         return immune(battle, actor, target, number, move, position, levitate=True)
     if type(move["accuracy"]) is int and not r.chance(accuracy(battle, actor, move, target)):
+        if move["name"] in MIND_BLOWN:
+            raise Unsupported("Chloroblast or Steel Beam missing")
         return immune(battle, actor, target, number, move, position, missed=True)
     hits = move.get("multihit", 1)
     if hits == [2, 5]:
@@ -490,6 +502,10 @@ def use(battle, actor, number, position):
             q += message(actor, 0, target)                  # the boss's fainted message, after the hit count
     if "recoil" in move and battle.b[actor].ability != ROCK_HEAD:
         q += recoil(battle, actor, move, total, knockout or faint)
+    if move["name"] == "Chloroblast":                       # half the user's maximum HP, rounded, Rock Head or not
+        if actor == BOSS:
+            raise Unsupported("the boss's Chloroblast")
+        q += recoil(battle, actor, dict(move, recoil=(1, 2)), battle.full[actor], False)
     q += queue.encode(0x2E, (2, actor - 1))
     if target == BOSS:
         q += queue.encode(0x85, (7, total))
@@ -526,7 +542,7 @@ def spread(battle, actor, number, move):
     battle.spreading = True
     try:
         for t in targets:
-            crit = battle.b[t].ability not in CRIT_GUARD and r.below(crit_draw(battle, actor, move)) == 0
+            crit = crit_roll(battle, actor, t, move)
             roll = r.below(16)
             dmg = battle.damage(actor, t, move, roll, crit)
             if dmg >= battle.hp[t]:
@@ -611,6 +627,16 @@ def accuracy(battle, actor, move, target):
     return min(acc, 100)
 
 
+def crit_roll(battle, actor, target, move):
+    """Whether the hit is critical: none into Battle or Shell Armor, always for a willCrit move (no draw),
+    else a below(n) draw of 0."""
+    if battle.b[target].ability in CRIT_GUARD:
+        return False
+    if "willCrit" in move["callbacks"]:
+        return True
+    return battle.rng.below(crit_draw(battle, actor, move)) == 0
+
+
 def crit_draw(battle, actor, move):
     """The critical hit's below(n): by the move's stage, raised 2 by Focus Energy (condition 9)."""
     stage = move.get("critRatio", 1) + 2 * (actor in battle.focused)
@@ -643,7 +669,7 @@ def strike(battle, actor, target, number, move, code, i, hits):
                   or battle.b[target].item == AIR_BALLOON or battle.b[target].ability in (RATTLED, SAND_SPIT)):
         raise Unsupported("a multi-hit move with an effect")
     # Battle Armor and Shell Armor (Showdown onCriticalHit false): no critical-hit draw
-    crit = battle.b[target].ability not in CRIT_GUARD and r.below(crit_draw(battle, actor, move)) == 0
+    crit = crit_roll(battle, actor, target, move)
     roll = r.below(16)
     dmg = battle.damage(actor, target, move, roll, crit)
     if target == BOSS:
@@ -732,6 +758,12 @@ def strike(battle, actor, target, number, move, code, i, hits):
     doubled = int(move["name"] == "Rising Voltage" and battle.move_power(actor, target, move)[0] != move["basePower"])
     record = (apos, tpos, number, mtype, doubled, i, 1, int(battle.tera_move(actor, move)), TARGET_CLASS.get(move["target"], 0), 0)
     q = b""
+    if move["name"] == "Steel Beam":                        # its half-HP cost before the damage: 0x01 (A, A, r, 0), 0x9a
+        cost = int(battle.full[actor] / 2 + 0.5)
+        if actor == BOSS or cost >= battle.hp[actor] or battle.b[actor].ability == MAGIC_GUARD:
+            raise Unsupported("Steel Beam by the boss, fainting its user or under Magic Guard")
+        battle.hp[actor] -= cost
+        q += queue.encode(0x01, (actor, actor, cost, 0)) + queue.encode(0x9A, (actor, -cost & 0xFFFFFFFF))
     if crit:
         q += queue.encode(0x37, (actor, 0, 1))
     q += queue.encode(0x37, (target, 2, dmg)) + queue.encode(0x37, (target, 5, 1))
@@ -805,6 +837,9 @@ def sand_spit(battle, b):
     q = queue.encode(0x6A, (0,)) + queue.encode(0x69, (0, 4)) + queue.encode(0x79, (4, 5, 0, b, 0))
     q += queue.encode(0x88, (4, b, 0))
     return queue.encode(0x25, (b,)) + queue.encode(0xC7, (b, 0)) + q + queue.encode(0xC8, (b,))
+
+
+MIND_BLOWN = frozenset({"Chloroblast", "Steel Beam"})       # Showdown mindBlownRecoil
 
 
 def recoil(battle, actor, move, dmg, knockout):
@@ -1908,9 +1943,6 @@ def weather_check(battle, acts):
     for actor, number, position in acts:
         move = MOVES.get(number) or {"type": "", "category": ""}
         target = BATTLER_AT.get(position)
-        if "snow" in battle.field and move["category"] == "Physical" and target and \
-                "Ice" in battle.defending(target):
-            raise Unsupported("an Ice-type target in snow")
 
 
 def terrain_check(battle, acts):
@@ -2071,8 +2103,6 @@ def residual(battle, b, kind):
     if battle.b[b].ability in (MAGIC_GUARD, 90):                # Magic Guard, Poison Heal
         raise Unsupported(f"battler {b}'s ability {battle.b[b].ability} against a status's damage")
     src, down = st[2], residual_knockout(battle, b, dmg)
-    if down:
-        raise Unsupported("a knockout by a status at a turn's end")     # not in the corpus
     if b == BOSS and boss_trigger(battle, dmg):
         raise Unsupported("a boss HP trigger at a turn's end")
     battle.hp[b] = max(0, battle.hp[b] - dmg)
