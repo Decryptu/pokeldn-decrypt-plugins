@@ -133,6 +133,7 @@ class Battle:
         self.field = set()                              # "sun", "rain", "snow", "sand"
         self.terrain = None                             # "Grassy", "Misty", "Electric", "Psychic"
         self.terrain_left = 0                           # turn ends until the terrain ends
+        self.fresh = set()                              # battlers revived since the last turn end
         self.charged = set()                            # battlers Wind Power charged (their next Electric move)
         self.sides = {0: {}, 1: {}}                     # side (0 players, 1 boss) -> {condition: [turns left, setter]}
         self.weather_left = 0                           # turn ends until the weather ends (0x79's 5)
@@ -1506,13 +1507,15 @@ def turn_end(battle, order):
     for b in battle.b.values():
         if b.item == LEFTOVERS and battle.hp[b.id] < battle.full[b.id]:
             raise Unsupported("Leftovers at the turn's end")
-        live = callbacks(b) & {"onResidual"}
+        live = callbacks(b, battle) & {"onResidual"}
+        if live and residual_idle(battle, b):
+            live = set()
         if battle.hp[b.id] and battle.status.get(b.id) and battle.status[b.id][0] not in (BRN, PSN, PAR, FRZ, SLP):
             raise Unsupported(f"battler {b.id}'s status at the turn's end")
         if b.ability == MOODY and battle.hp[b.id]:
             raise Unsupported("Moody at the turn's end")
         if live:
-            raise Unsupported(f"battler {b.id}'s residual at the turn's end")
+            raise Unsupported(f"battler {b.id}'s residual at the turn's end: ability {b.ability} item {b.item}")
     q = queue.encode(0xC5, (0,)) + queue.encode(0x50, (0,)) + weather_end(battle)
     if "sand" in battle.field:
         q += sandstorm(battle, order)
@@ -1523,14 +1526,27 @@ def turn_end(battle, order):
     q += side_end(battle)
     q += b"".join(queue.encode(0x44, (k,)) for k in range(1, 9)) + terrain_end(battle)
     q += b"".join(queue.encode(0x44, (k,)) for k in range(9, 14))
+    fresh, battle.fresh = battle.fresh, set()
     for b in order:
-        if battle.hp[b] and battle.b[b].ability == SPEED_BOOST:
+        if battle.hp[b] and battle.b[b].ability == SPEED_BOOST and b not in fresh:      # Showdown: activeTurns
             if battle.stages[b][5] == 6:
                 raise Unsupported("Speed Boost at +6")
             battle.stages[b][5] += 1                        # Speed Boost: +1 Speed after the turn's end
             q += queue.encode(0x25, (b,)) + queue.encode(0xC7, (b, 0)) + queue.encode(0x0C, (b, 5, 1))
             q += queue.encode(0x92, (b, 5, 1, 0)) + message(b, 15, b) + queue.encode(0xC8, (b,))
     return q
+
+
+def residual_idle(battle, b):
+    """Whether an ability's onResidual does nothing and draws nothing this turn end (Showdown abilities.ts):
+    Shed Skin and Hydration (in rain) with no status, Healer with no statused ally (the boss has none)."""
+    if b.ability == 61:                                     # Shed Skin: chance(33) only while statused
+        return not battle.status.get(b.id)
+    if b.ability == 93:                                     # Hydration
+        return "rain" not in battle.field or not battle.status.get(b.id)
+    if b.ability == 131:                                    # Healer: its allies' statuses
+        return b.id == BOSS or not any(battle.status.get(i) for i in battle.b if i not in (b.id, BOSS))
+    return False
 
 
 def residual(battle, b, kind):
@@ -1655,6 +1671,7 @@ def revive(battle, slot):
         raise Unsupported(f"battler {b}'s item {x.item} on its revive")
     battle.hp[b] = battle.full[b]
     battle.stages[b] = [0] * 8
+    battle.fresh.add(b)
     if b not in battle.listed:
         battle.listed.append(b)
     pos = slot
