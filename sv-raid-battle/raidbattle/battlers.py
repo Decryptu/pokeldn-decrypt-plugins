@@ -84,4 +84,11 @@ def battle(bootstrap, partners):
     from raidbattle import raid
     battle.raid = raid.Raid(profile, game_limit if active else DEFAULT_LIMIT)
     start.body(b, battle.stages, battle)
+    boss = b[rounds.BOSS]
+    if boss.transformed:                    # Showdown transformInto: the copied stats but HP, moves at 5 PP, types
+        source = b[boss.transformed]
+        boss.stats = (boss.stats[0],) + tuple(source.stats[1:])
+        boss.moves, boss.pp = source.moves, [5 if m else 0 for m in source.moves]
+        battle.types[rounds.BOSS] = list(battle.types[source.id])
+        battle.stages[rounds.BOSS] = list(battle.stages[source.id])
     return battle

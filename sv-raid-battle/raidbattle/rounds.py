@@ -1181,6 +1181,13 @@ def focus_energy(battle, actor, number, position, move):
 def status_use(battle, actor, number, position):
     """-> the queue for a stat-stage status move: one zero group, no hit, the hit record with the
     move's target class, the stat changes."""
+    if MOVES[number]["name"] == "Transform" and battle.b[actor].transformed:
+        q = queue.encode(0xC9, (actor, 0, number, position, 1)) + queue.encode(0x7B, (number, battle.rounds, actor))
+        for size in (20, 5, 5, 5, 19):
+            q += queue.encode_group(0xCF, bytes(size))
+        q += queue.encode(0xCA, (actor, 567, END) + (0,) * 7)       # already transformed: it fails
+        q += queue.encode(0x1D, (actor, position, TYPES.index("Normal"), 1, 0, number, number))
+        return q + queue.encode(0x5B, (actor, number)) * 2 + queue.encode(0x1E, (actor, 0))
     move = status_move(battle, MOVES[number])
     if number in UNSEEN_MOVES:
         raise Unsupported(f"move {number} was never probed")
@@ -1902,8 +1909,6 @@ def round_end(battle, entries, acted, won, counted):
 def build(battle, slot, command):
     """-> (the round body for `slot`'s command, whether it wins)."""
     acts = actions(command)
-    if any(b.transformed for b in battle.b.values()):
-        raise Unsupported("a transformed battler")       # its copied stats, moves and types are not built
     weather_check(battle, acts)
     battle.fresh -= {a[0] for a in acts}                    # acting counts as a turn in (Speed Boost's activeTurns)
     involved = {a[0] for a in acts} | {BATTLER_AT[a[2]] for a in acts if a[2] in BATTLER_AT}
@@ -1913,9 +1918,6 @@ def build(battle, slot, command):
             live = {k for k in live if k == "onResidual" or k.startswith("onAny")}
         if live:
             raise Unsupported(f"battler {b.id}'s ability {b.ability} or item {b.item}: {sorted(live)[0]}")
-    key = lambda a: (priority(battle, a[0], a[1]), paced(battle, a[0], a[1]), battle.speed(a[0]))
-    if len({key(a) for a in acts}) != len(acts) and any(a[1] in HANDLER_MOVES for a in acts):
-        raise Unsupported("a speed tie with a handler move")
     entries = [Entry(a, Entry.MOVE, move=n, position=p) for a, n, p in acts]
     q = run_actions(battle, entries)
     won = not battle.hp[BOSS]
