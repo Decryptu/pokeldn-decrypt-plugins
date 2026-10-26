@@ -430,6 +430,11 @@ def use(battle, actor, number, position):
         raise Unsupported("a move the weather changes")
     if battle.effectiveness(move["type"], target) == 0:
         return immune(battle, actor, target, number, move, position)
+    absorb = ABSORB.get(battle.b[target].ability)
+    if absorb and move["type"] == absorb[0] and battle.b[actor].ability not in MOLD_BREAKERS:
+        if battle.stages[target][absorb[1]] == 6:
+            raise Unsupported("an absorbing ability at +6")
+        return immune(battle, actor, target, number, move, position, absorb=absorb[1])
     if move["type"] == "Ground" and battle.b[target].ability == LEVITATE:
         if battle.b[actor].ability in MOLD_BREAKERS:
             raise Unsupported("a Ground move into Levitate under Mold Breaker")
@@ -806,7 +811,11 @@ def recoil(battle, actor, move, dmg, knockout):
     return q + message(actor, 127, actor) + queue.encode(0x37, (actor, 4, r))
 
 
-def immune(battle, actor, target, number, move, position, missed=False, floor=False, levitate=False, gone=False):
+ABSORB = {157: ("Grass", 1), 78: ("Electric", 5)}           # Sap Sipper, Motor Drive: immune, +1 to the stat
+
+
+def immune(battle, actor, target, number, move, position, missed=False, floor=False, levitate=False, gone=False,
+           absorb=0):
     """A damaging move the target's types are immune to (no draw), or one that missed: five zero groups,
     message 72 and 0x52 (A, 3), or message 73 and 0x52 (A, 1); a stat-dropping move into stats all at -6
     (`floor`, no draw): message 59 + stat per stat, or on its user's stats all at +6, 52 + stat; a Ground move into Levitate (no draw): message 72 about the target
@@ -828,6 +837,11 @@ def immune(battle, actor, target, number, move, position, missed=False, floor=Fa
     elif levitate:
         q += queue.encode(0x25, (target,)) + queue.encode(0xC7, (target, 0)) + message(target, 72, target)
         q += queue.encode(0xC8, (target,)) + queue.encode(0x52, (actor, 3))
+    elif absorb:                                            # the stat raise inside the activation, then 0x52 (A, 2)
+        battle.stages[target][absorb] += 1
+        q += queue.encode(0x25, (target,)) + queue.encode(0xC7, (target, 0)) + queue.encode(0x0C, (target, absorb, 1))
+        q += queue.encode(0x92, (target, absorb, 1, 0)) + message(target, RAISE_TEXT[1] + absorb, target)
+        q += queue.encode(0xC8, (target,)) + queue.encode(0x52, (actor, 2))
     else:
         q += message(actor, 73 if missed else 72, target) + queue.encode(0x52, (actor, 1 if missed else 3))
     q += pp(battle, 0x08, actor, number)
@@ -1126,6 +1140,8 @@ def status_use(battle, actor, number, position):
                 battle.b[target].ability == PURIFYING_SALT or \
                 battle.effectiveness(move["type"], target) == 0 and move["name"] == "Thunder Wave":
             raise Unsupported("a status move that fails")
+    if not own and ABSORB.get(battle.b[target].ability, ("",))[0] == move["type"]:
+        raise Unsupported("a status move into an absorbing ability")
     if not own and "powder" in move["flags"] and "Grass" in battle.defending(target):
         raise Unsupported("a powder move on a Grass type")
     if not own and battle.b[actor].ability == PRANKSTER and "Dark" in battle.defending(target):
@@ -1491,6 +1507,8 @@ def callbacks(b, battle=None, acts=()):
         live.discard("onFractionalPriority")            # order_key and the 0x51 pass apply them
     if b.ability in (FILTER, SOLID_ROCK):
         live.discard("onSourceModifyDamage")            # Battle.damage applies them
+    if b.ability in ABSORB:
+        live = set()                                    # use() absorbs a damaging move; status_use refuses one
     if b.ability == PURIFYING_SALT:
         live -= {"onSourceModifyAtk", "onSourceModifySpA", "onSetStatus"}   # Battle.damage and inflict apply them
     if b.ability == TANGLED_FEET and b.id in getattr(battle, "confused", {}):
