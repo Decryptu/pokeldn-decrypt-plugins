@@ -714,8 +714,8 @@ def recoil(battle, actor, move, dmg, knockout):
     0x9a (A, -r), message 127, 0x37 (A, 4, r)."""
     n, d = move["recoil"]
     r = max(1, int(dmg * n / d + 0.5))
-    if knockout or r >= battle.hp[actor] or battle.b[actor].ability == MAGIC_GUARD:
-        raise Unsupported("recoil that faints, after a knockout, or under Rock Head or Magic Guard")
+    if r >= battle.hp[actor] or battle.b[actor].ability == MAGIC_GUARD:     # a knockout before it changes nothing
+        raise Unsupported("recoil that faints or under Magic Guard")
     battle.hp[actor] -= r
     q = queue.encode(0x01, (actor, actor, r, 4)) + queue.encode(0x9A, (actor, -r & 0xFFFFFFFF))
     return q + message(actor, 127, actor) + queue.encode(0x37, (actor, 4, r))
