@@ -133,6 +133,7 @@ class Battle:
         self.field = set()                              # "sun", "rain", "snow", "sand"
         self.terrain = None                             # "Grassy", "Misty", "Electric", "Psychic"
         self.terrain_left = 0                           # turn ends until the terrain ends
+        self.charged = set()                            # battlers Wind Power charged (their next Electric move)
         self.sides = {0: {}, 1: {}}                     # side (0 players, 1 boss) -> {condition: [turns left, setter]}
         self.weather_left = 0                           # turn ends until the weather ends (0x79's 5)
         self.weather_by = 0                             # the battler that set it (0x01's second argument)
@@ -321,6 +322,8 @@ def use(battle, actor, number, position):
         raise Unsupported(f"move {number} was never probed")
     target = BATTLER_AT[position]
     r = battle.rng
+    if actor in battle.charged and move["type"] == "Electric":
+        raise Unsupported("a charged battler's Electric move")
     if "sand" in battle.field and move["name"] in SAND_MOVES:
         raise Unsupported("a move the weather changes")
     if battle.effectiveness(move["type"], target) == 0:
@@ -668,20 +671,27 @@ SIDE_TURNS = {TAILWIND: 4}
 SIDE_TEXT = {TAILWIND: (643, 645)}      # start, end
 
 
-WIND_ABILITIES = frozenset({274, 277})                     # Wind Rider, Wind Power: Tailwind on their side
+WIND_RIDER, WIND_POWER = 274, 277
 
 
 def side_start(battle, b, cond):
     """A side condition raised by battler b on its side: 0x4a and 0x65 (side, cond, 0, 34, b), 0xca (b, start
     text, side)."""
     side = int(b == BOSS)
-    if cond == TAILWIND and any(x.ability in WIND_ABILITIES for i, x in battle.b.items() if int(i == BOSS) == side):
-        raise Unsupported("Tailwind beside Wind Rider or Wind Power")
+    mine = [i for i in sorted(battle.b) if int(i == BOSS) == side and battle.hp[i]]
+    if cond == TAILWIND and any(battle.b[i].ability == WIND_RIDER for i in mine):
+        raise Unsupported("Tailwind beside Wind Rider")
     if cond in battle.sides[side]:
         raise Unsupported("a side condition already up")
     battle.sides[side][cond] = [SIDE_TURNS[cond], b]
     q = queue.encode(0x4A, (side, cond, 0, 34, b)) + queue.encode(0x65, (side, cond, 0, 34, b))
-    return q + queue.encode(0xCA, (b, SIDE_TEXT[cond][0], side, END) + (0,) * 6)
+    q += queue.encode(0xCA, (b, SIDE_TEXT[cond][0], side, END) + (0,) * 6)
+    for i in mine if cond == TAILWIND else ():
+        if battle.b[i].ability == WIND_POWER:               # charged by its side's Tailwind: condition 20
+            battle.charged.add(i)
+            q += queue.encode(0x25, (i,)) + queue.encode(0xC7, (i, 0)) + message(i, 1024, i, 366)
+            q += queue.encode(0xC8, (i,)) + queue.encode(0x1E, (i, 20)) + queue.encode(0x7D, (20, i, 0, 0))
+    return q
 
 
 def side_end(battle):
@@ -1002,6 +1012,7 @@ def player_down(battle, victim, actor, number, quiet=False):
     battle.faints[victim] += 1
     battle.status.pop(victim, None)                         # a faint clears its status
     battle.confused.pop(victim, None)
+    battle.charged.discard(victim)
     for e in battle.entries:
         if e.actor == victim:
             e.done = True                                   # its actions are marked run
