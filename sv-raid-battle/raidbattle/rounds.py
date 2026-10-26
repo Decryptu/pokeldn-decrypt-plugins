@@ -1473,13 +1473,13 @@ def run(battle, e, entries):
         return raid_action(battle, e, entries)
     if e.kind == Entry.RESET:
         return reset(battle, e.value)
-    if battle.status.get(e.actor, (0,))[0] == PAR:
-        raise Unsupported("a paralysed boss's raid move")
-    pre, goes = confusion(battle, e.actor) if e.actor in battle.confused else (b"", True)
+    if battle.status.get(e.actor, (0,))[0] in (FRZ, SLP):
+        raise Unsupported("a frozen or sleeping boss's raid move")
+    pre, goes, why = before_move(battle, e)                 # its confusion and paralysis, as a commanded move's
     used = handler(battle, (e.actor, e.move), 0x72000, last=False) + pre
     if goes:
         used += use(battle, e.actor, e.move, e.position)
-    else:                                                   # it hit itself: the move's end with no hit
+    else:                                                   # stopped: the move's end with no hit
         move = MOVES.get(e.move) or {"type": "Normal"}
         used += queue.encode(0x1D, (e.actor, e.position, TYPES.index(move["type"]), 0, 0, e.move, e.move))
         used += queue.encode(0x5B, (e.actor, e.move)) * 2 + queue.encode(0x1E, (e.actor, 0))
