@@ -539,9 +539,10 @@ def recoil(battle, actor, move, dmg, knockout):
     return q + message(actor, 127, actor) + queue.encode(0x37, (actor, 4, r))
 
 
-def immune(battle, actor, target, number, move, position, missed=False):
+def immune(battle, actor, target, number, move, position, missed=False, floor=False):
     """A damaging move the target's types are immune to (no draw), or one that missed: five zero groups,
-    message 72 and 0x52 (A, 3), or message 73 and 0x52 (A, 1)."""
+    message 72 and 0x52 (A, 3), or message 73 and 0x52 (A, 1); a stat-dropping move into stats all at -6
+    (`floor`, no draw): message 60 alone."""
     mtype = TYPES.index(move["type"])
     q = b""
     if actor != BOSS:
@@ -550,7 +551,10 @@ def immune(battle, actor, target, number, move, position, missed=False):
     q += queue.encode(0x7B, (number, battle.rounds, actor))
     for size in (20, 5, 5, 5, 19):
         q += queue.encode_group(0xCF, bytes(size))
-    q += message(actor, 73 if missed else 72, target) + queue.encode(0x52, (actor, 1 if missed else 3))
+    if floor:
+        q += message(actor, 60, target)
+    else:
+        q += message(actor, 73 if missed else 72, target) + queue.encode(0x52, (actor, 1 if missed else 3))
     q += pp(battle, 0x08, actor, number)
     q += queue.encode(0x52, (actor, 0)) + queue.encode(0x1D, (actor, position, mtype, 0, 0, number, number))
     q += queue.encode(0x5B, (actor, number)) * 2 + queue.encode(0x1E, (actor, 0))
@@ -686,6 +690,18 @@ def raise_stats(battle, b, boosts):
     return q
 
 
+def shielded(battle, actor, number, position, move):
+    """A status move into the shielded boss fails before it runs (120 of 120 stat-drop and status moves in
+    the corpora): 0xc9 (A, 0, M, P, 1), 0xca (A, 567, A), 0x52 (A, 0), 0x1d with no hit, 0x5b twice, 0x1e."""
+    q = b""
+    if actor != BOSS:
+        q += queue.encode(0x05, (actor, battle.slot(actor, number), 2 if battle.b[BOSS].ability == PRESSURE else 1))
+    q += pp(battle, 0x07, actor, number) + queue.encode(0xC9, (actor, 0, number, position, 1))
+    q += queue.encode(0xCA, (actor, 567, actor, END) + (0,) * 6) + queue.encode(0x52, (actor, 0))
+    q += queue.encode(0x1D, (actor, position, TYPES.index(move["type"]), 0, 0, number, number))
+    return q + queue.encode(0x5B, (actor, number)) * 2 + queue.encode(0x1E, (actor, 0))
+
+
 def status_use(battle, actor, number, position):
     """-> the queue for a stat-stage status move: one zero group, no hit, the hit record with the
     move's target class, the stat changes."""
@@ -707,6 +723,13 @@ def status_use(battle, actor, number, position):
         raise Unsupported("a powder move on a Grass type")
     if not own and battle.b[actor].ability == PRANKSTER and "Dark" in battle.defending(target):
         raise Unsupported("Prankster's move on a Dark type")
+    if not own and target == BOSS and battle.raid.state == 1:
+        return shielded(battle, actor, number, position, move)
+    if not own and not move.get("status") and all(battle.stages[target][STATS[k]] == -6 for k in move["boosts"]):
+        if any(d >= 0 for d in move["boosts"].values()):
+            raise Unsupported("a raise on a foe")
+        stat_drop(battle, actor, target, {})                    # what answers a drop still refuses
+        return immune(battle, actor, target, number, move, position, floor=True)
     r = battle.rng
     if type(move["accuracy"]) is int:
         if battle.stages[actor][6] or battle.stages[target][7]:
@@ -1105,7 +1128,12 @@ def run(battle, e, entries):
         battle.moved.add(e.actor)
     if e.kind == Entry.MOVE:
         q += handler(battle, (e.actor, e.move), 0x72000, last=False)
-        pre, goes, why = before_move(battle, e)
+        empty = e.actor != BOSS and e.move in battle.b[e.actor].moves and \
+            not battle.b[e.actor].pp[battle.b[e.actor].moves.index(e.move)]
+        if empty and (e.actor in battle.flinched or e.actor in battle.confused or
+                      battle.status.get(e.actor, (0,))[0] in (FRZ, SLP)):
+            raise Unsupported("a move with no PP left from a flinched, confused, frozen or sleeping battler")
+        pre, goes, why = (b"", True, None) if empty else before_move(battle, e)   # no PP: before paralysis
         if goes and e.actor != BOSS and no_pp(battle, e):
             q += pre + queue.encode(0xC9, (e.actor, 0, e.move, 10, 1))
             q += queue.encode(0xCA, (e.actor, 578, e.actor, END) + (0,) * 6) + queue.encode(0x52, (e.actor, 0))
