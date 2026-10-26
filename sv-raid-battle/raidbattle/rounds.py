@@ -46,6 +46,8 @@ AIR_BALLOON = 541
 SHIELDS_DOWN = 197
 LEVITATE = 26
 ICE_SCALES = 246
+FILTER, SOLID_ROCK, PRISM_ARMOR = 111, 116, 232
+TANGLED_FEET, TOXIC_BOOST = 77, 137
 ROCK_HEAD, MAGIC_GUARD = 69, 98
 PINCH = {65: "Grass", 66: "Fire", 67: "Water", 68: "Bug"}
 HUGE_POWER, PURE_POWER, ADAPTABILITY = 37, 74, 91
@@ -65,6 +67,7 @@ CONTACT_STATUS = frozenset((9, 38, 49, 56))     # Static, Poison Point, Flame Bo
 CUTE_CHARM = 56                                 # draws only between a male and a female
 MOLD_BREAKERS = frozenset((104, 163, 164))      # Mold Breaker, Turboblaze, Teravolt: Inner Focus ignored
 POISON_TOUCH = 143                              # the attacker's
+CONTACT_STATUSES = {9: "par", 38: "psn", 49: "brn"}
 RATTLED = 155                                   # +1 Speed, hit by a Bug, Dark or Ghost move
 STALL = 100                 # moves last in its bracket; 0x51 (b, 0) in the speed pass
 PRANKSTER, MYCELIUM_MIGHT = 158, 298
@@ -161,12 +164,14 @@ class Battle:
         moves = self.b[battler].moves
         return moves.index(number) if number in moves else None if battler == BOSS else 0
 
-    def speed(self, battler, side=True):
+    def speed(self, battler, raw=False):
         """The Speed the turn order reads: the stat at its stage, doubled by a weather's speed ability (Swift
         Swim, Chlorophyll, Sand Rush, Slush Rush), halved while paralysed."""
         spe = staged(self.b[battler].speed, self.stages[battler][5])
+        if raw:
+            return spe                                      # a sort's handler key: no Tailwind, no paralysis
         rush = SPEED_WEATHER.get(self.b[battler].ability) in self.field
-        tail = side and TAILWIND in self.sides[int(battler == BOSS)]
+        tail = TAILWIND in self.sides[int(battler == BOSS)]
         paralysed = self.status.get(battler, (0,))[0] == PAR
         if rush + tail + paralysed > 1:
             raise Unsupported("Speed modifiers chained")
@@ -275,7 +280,8 @@ class Battle:
             if boosted or ability_boost or a.ability == RIVALRY and a.gender < 2 and d.gender < 2:
                 raise Unsupported("a terrain's power chained with another")
             power = modify(power, terrain)
-        if own:
+        late = move["name"] in ("Electro Drift", "Collision Course")      # on the damage, after the type
+        if own and not late:
             if boosted or ability_boost or terrain or a.ability == RIVALRY and a.gender < 2 and d.gender < 2:
                 raise Unsupported("a move's power chained with another")
             power = modify(power, own)
@@ -296,6 +302,15 @@ class Battle:
             if a.ability == GUTS or move["name"] == "Facade":
                 raise Unsupported("Guts or Facade while burned")
             x = modify(x, 0.5)                              # Showdown getDamage: a burned user's physical move
+        armor = e > 1 and (d.ability == PRISM_ARMOR or d.ability in (FILTER, SOLID_ROCK) and a.ability not in MOLD_BREAKERS)
+        if armor:
+            if own and late or d.ability == ICE_SCALES:
+                raise Unsupported("an armor ability chained with another")
+            x = modify(x, 0.75)                             # Showdown abilities.ts: Filter, Solid Rock, Prism Armor
+        if own and late:
+            if a.ability == TINTED_LENS and e < 1 or d.ability == ICE_SCALES:
+                raise Unsupported("a move's damage chained with another")
+            x = modify(x, own)
         if d.ability == ICE_SCALES and move["category"] == "Special" and a.ability not in MOLD_BREAKERS:
             if a.ability == TINTED_LENS and e < 1:
                 raise Unsupported("Tinted Lens chained with Ice Scales")
@@ -407,6 +422,8 @@ def use(battle, actor, number, position):
         if code > 7:
             q += queue.encode(0x20, (actor, 24)) * done
         q += queue.encode(0xA6, (96,))
+        if knockout:
+            q += message(actor, 0, target)                  # the boss's fainted message, after the hit count
     if "recoil" in move and battle.b[actor].ability != ROCK_HEAD:
         q += recoil(battle, actor, move, total, knockout or faint)
     q += queue.encode(0x2E, (2, actor - 1))
@@ -500,11 +517,16 @@ def strike(battle, actor, target, number, move, code, i, hits):
             if set(sec) != {"chance", "boosts"} or knockout:
                 raise Unsupported("a secondary effect")
             drops += stat_drop(battle, actor, target, sec["boosts"])
+    contact = b""
     attract = battle.b[target].ability != CUTE_CHARM or battle.b[actor].gender + battle.b[target].gender == 1
     if "contact" in move["flags"] and not knockout and (battle.b[target].ability in CONTACT_STATUS and attract or
                                                         battle.b[actor].ability == POISON_TOUCH):
         if r.chance(30):                                    # Showdown: randomChance(3, 10) on contact, after the secondaries
-            raise Unsupported("a contact ability's status")
+            if battle.b[actor].ability == POISON_TOUCH or battle.b[target].ability == CUTE_CHARM:
+                raise Unsupported("a contact ability's status")
+            landed = inflict(battle, target, actor, CONTACT_STATUSES[battle.b[target].ability])
+            if landed:                                      # inside the target's ability activation
+                contact = queue.encode(0x25, (target,)) + queue.encode(0xC7, (target, 0)) + landed + queue.encode(0xC8, (target,))
     battle.hp[target] -= dmg
     mtype, cat = TYPES.index(move["type"]), 1 if move["category"] == "Physical" else 2
     apos, tpos = POSITION[actor], POSITION[target]
@@ -551,7 +573,7 @@ def strike(battle, actor, target, number, move, code, i, hits):
         battle.stages[target][5] += 1
         q += queue.encode(0x25, (target,)) + queue.encode(0xC7, (target, 0)) + queue.encode(0x0C, (target, 5, 1))
         q += queue.encode(0x92, (target, 5, 1, 0)) + message(target, 15, target) + queue.encode(0xC8, (target,))
-    q += drops
+    q += drops + contact
     if "drain" in move:
         n, d = move["drain"]
         heal = int(dmg * n / d + 0.5)                       # the commands carry it uncapped
@@ -1130,6 +1152,12 @@ def callbacks(b, battle=None, acts=()):
             live = set()
     if b.ability in (STALL, MYCELIUM_MIGHT):
         live.discard("onFractionalPriority")            # order_key and the 0x51 pass apply them
+    if b.ability in (FILTER, SOLID_ROCK):
+        live.discard("onSourceModifyDamage")            # Battle.damage applies them
+    if b.ability == TANGLED_FEET and b.id in getattr(battle, "confused", {}):
+        live.add("onModifyAccuracy")                    # confused, it is harder to hit
+    if b.ability == TOXIC_BOOST and battle is not None and battle.status.get(b.id, (0,))[0] == PSN:
+        live.add("onBasePower")
     if b.ability == MYCELIUM_MIGHT and not any(a == b.id and (MOVES.get(n) or {}).get("category") == "Status"
                                                for a, n, p in acts):
         live.discard("onModifyMove")                    # it ignores abilities for its status moves only
@@ -1277,6 +1305,11 @@ def run(battle, e, entries):
         battle.moved.add(e.actor)
     if e.kind == Entry.MOVE:
         q += handler(battle, (e.actor, e.move), 0x72000, last=False)
+        if e.actor != BOSS and (MOVES.get(e.move) or {}).get("isNonstandard") in ("Past", "LGPE"):
+            if e.move not in PAST_KNOWN:
+                raise Unsupported(f"move {e.move}, not in the game, with no handler known")
+            q += queue.encode(0xCA, (e.actor, 567, e.actor, END) + (0,) * 6) + queue.encode(0x52, (e.actor, 0))
+            return q + queue.encode(0x5B, (e.actor, e.move)) * 2 + queue.encode(0x1E, (e.actor, 0))   # not in the game
         empty = e.actor != BOSS and e.move in battle.b[e.actor].moves and \
             not battle.b[e.actor].pp[battle.b[e.actor].moves.index(e.move)]
         if empty and (e.actor in battle.flinched or e.actor in battle.confused or
@@ -1671,7 +1704,8 @@ def handler(battle, act, base, last=True):
         return b""
     if base:                                                # the run's key: priority + 7, then the 0x51 value
         base = (priority(battle, actor, number) + 7) << 16 | battle.paced.get(actor, 1) << 13
-    q = queue.encode(0x5A, (actor, number, base + battle.speed(actor, side=False)))    # no Tailwind in it
+    # a sort's key reads the stat at its stage; the run's key the Speed with Tailwind and paralysis
+    q = queue.encode(0x5A, (actor, number, base + battle.speed(actor, raw=not base)))
     return q + queue.encode(0x5B, (actor, number)) if last else q
 
 
@@ -1698,6 +1732,9 @@ def speed_order(battle, items, key):
 
 _probe = _data("handler_moves.json")
 HANDLER_MOVES, UNSEEN_MOVES = frozenset(_probe["handler"]), frozenset(_probe["unseen"])
+# a move not in Scarlet / Violet (never probed) whose handler the corpus showed: with 0x5a, or used with none
+HANDLER_MOVES |= frozenset(_probe["past_handler"])
+PAST_KNOWN = HANDLER_MOVES | frozenset(_probe["past_plain"])
 
 
 REVIVE_ABILITIES = frozenset((46, 104, 163, 164, 213, 119, 107, 127))   # announced again as at the start
