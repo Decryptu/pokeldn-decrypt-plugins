@@ -1046,12 +1046,14 @@ def stat_drop(battle, actor, target, boosts, secondary=True):
         stat, n = STATS[key], -delta
         if STAT_GUARD.get(b.ability) == stat:
             raise Unsupported(f"battler {target}'s ability {b.ability} guards stat {stat}")
+        if secondary and battle.stages[target][stat] == -6:
+            continue                                        # a secondary's drop at -6: nothing shows
         if n not in (1, 2) or battle.stages[target][stat] - n < -6:
             raise Unsupported("a stat drop past -6 or not 1 or 2 stages")
         battle.stages[target][stat] -= n
         q += queue.encode(0x0D, (target, stat, n)) + queue.encode(0x93, (target, stat, n, 0))
         q += message(actor, (31 if n == 1 else 38) + stat, target, stat)
-    if answer and boosts:
+    if answer and q:
         up = 1 if b.ability == DEFIANT else 3
         if battle.stages[target][up] + 2 > 6:
             raise Unsupported("Defiant or Competitive near +6")
