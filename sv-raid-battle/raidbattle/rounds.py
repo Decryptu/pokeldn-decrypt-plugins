@@ -174,6 +174,7 @@ class Battle:
         self.charged = set()
         self.spent = {}
         self.focused = set()
+        self.healblock = {}                             # battler -> turn ends of Heal Block left
         self.salted = {}                                # battler -> the battler whose Salt Cure hit it
         self.trick_left = 0                             # turn ends until Trick Room ends
         self.stockpile = collections.Counter()          # battler -> Stockpile layers                            # battlers under Focus Energy
@@ -734,6 +735,12 @@ def strike(battle, actor, target, number, move, code, i, hits):
             if set(sec) == {"chance", "self"} and not knockout:
                 drops += raise_stats(battle, actor, sec["self"]["boosts"], secondary=True)     # Flame Charge and kin
                 continue
+            if sec.get("volatileStatus") == "healblock" and not knockout:
+                if target in battle.healblock:
+                    raise Unsupported("Heal Block again")
+                battle.healblock[target] = 2                    # condition 15 for two turn ends
+                drops += queue.encode(0x13, (target, 15, 0, 2 << 3 | 2, actor)) + message(actor, 283, target)
+                continue
             if sec.get("volatileStatus") == "saltcure" and not knockout:
                 if target in battle.salted:
                     continue                                # already salted: nothing shows
@@ -741,7 +748,7 @@ def strike(battle, actor, target, number, move, code, i, hits):
                 drops += queue.encode(0x13, (target, 46, 0, 1, actor)) + message(actor, 1033, target, actor)
                 continue
             if set(sec) != {"chance", "boosts"} or knockout:
-                raise Unsupported("a secondary effect")
+                raise Unsupported(f"a secondary effect: {move['name']} {sec}")
             drops += stat_drop(battle, actor, target, sec["boosts"])
     contact, rough = b"", 0
     attract = battle.b[target].ability != CUTE_CHARM or battle.b[actor].gender + battle.b[target].gender == 1
@@ -825,6 +832,8 @@ def strike(battle, actor, target, number, move, code, i, hits):
             raise Unsupported("a self drop beside secondaries")     # their draw order is unmeasured
         r.chance(100)                                       # drawn as a secondary's chance
         drops = stat_drop(battle, actor, actor, move["self"]["boosts"], secondary=False, own=True) + drops
+    if "drain" in move and actor in battle.healblock:
+        raise Unsupported("a drain under Heal Block")
     if "drain" in move:                                     # in the damage step: before the secondaries and contact
         n, d = move["drain"]
         heal = int(dmg * n / d + 0.5)                       # the commands carry it uncapped
@@ -1489,6 +1498,7 @@ def player_down(battle, victim, actor, number, quiet=False, src=None):
     battle.confused.pop(victim, None)
     battle.charged.discard(victim)
     battle.focused.discard(victim)
+    battle.healblock.pop(victim, None)
     battle.salted.pop(victim, None)
     battle.stockpile.pop(victim, None)
     for e in battle.entries:
@@ -2034,6 +2044,10 @@ def turn_end(battle, order):
         for b in order:
             if battle.hp[b]:
                 q += queue.encode(0x19, (b, k)) + residual(battle, b, k)
+    for b in list(battle.healblock):
+        battle.healblock[b] -= 1
+        if not battle.healblock[b]:
+            raise Unsupported("Heal Block ends")            # its end is not in the corpus
     if battle.trick_left:
         battle.trick_left -= 1
         if not battle.trick_left:
@@ -2071,6 +2085,8 @@ def leftovers(battle, order):
     for b in order:
         if battle.b[b].item != LEFTOVERS or not battle.hp[b] or battle.hp[b] >= battle.full[b]:
             continue
+        if b in battle.healblock:
+            raise Unsupported("Leftovers under Heal Block")
         if battle.b[b].ability in (UNNERVE_ID, 82, 247):                    # Unnerve, Gluttony, Ripen
             raise Unsupported(f"battler {b}'s ability beside its Leftovers")
         heal = max(1, battle.b[b].stats[0] // 16)           # shown whole, though the HP stops at the maximum
