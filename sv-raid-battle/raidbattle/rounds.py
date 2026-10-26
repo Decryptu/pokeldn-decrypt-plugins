@@ -368,6 +368,8 @@ class Battle:
             if own and late or d.ability == ICE_SCALES:
                 raise Unsupported("an armor ability chained with another")
             x = modify(x, 0.75)                             # Showdown abilities.ts: Filter, Solid Rock, Prism Armor
+        if a.item == LIFE_ORB and target != BOSS:
+            raise Unsupported("Life Orb's damage on a player")  # into the boss the corpus shows no boost
         screen = (REFLECT if physical else LIGHT_SCREEN) in self.sides[int(target == BOSS)] and not crit
         if screen:
             if own and late or armor or d.ability == ICE_SCALES or a.ability in (TINTED_LENS, 151):
@@ -511,6 +513,15 @@ def use(battle, actor, number, position):
             q += message(actor, 0, target)                  # the boss's fainted message, after the hit count
     if "recoil" in move and battle.b[actor].ability != ROCK_HEAD:
         q += recoil(battle, actor, move, total, knockout or faint)
+    if battle.b[actor].item == LIFE_ORB and total and battle.b[actor].ability != MAGIC_GUARD:
+        if "recoil" in move or move["name"] == "Chloroblast" or battle.b[actor].ability == 125:
+            raise Unsupported("Life Orb beside recoil or Sheer Force")
+        cost = max(1, battle.full[actor] // 10)
+        if actor == BOSS or cost >= battle.hp[actor]:
+            raise Unsupported("Life Orb on the boss or fainting its holder")
+        battle.hp[actor] -= cost                            # after the hit's 0xd1: 0x01 (A, A, cost, 29), 0x9a, message 328
+        q += queue.encode(0x01, (actor, actor, cost, 29)) + queue.encode(0x9A, (actor, -cost & 0xFFFFFFFF))
+        q += message(actor, 328, actor)
     if move["name"] == "Chloroblast":                       # half the user's maximum HP, rounded, Rock Head or not
         if actor == BOSS:
             raise Unsupported("the boss's Chloroblast")
@@ -1283,10 +1294,12 @@ def status_use(battle, actor, number, position):
 STATS = {"atk": 1, "def": 2, "spa": 3, "spd": 4, "spe": 5, "accuracy": 6, "evasion": 7}
 def ordered(boosts):
     """A move's stat changes in the order the game applies them: moves.json sorts them by name, the game keeps
-    Showdown's source order, which is the stat order but for Shift Gear's (Speed, then Attack)."""
+    Showdown's source order, which is the stat order but for Shift Gear's and V-create's (Speed first)."""
     keys = tuple(sorted(boosts, key=STATS.get))
     if keys == ("atk", "spe") and boosts == {"atk": 1, "spe": 2}:
         keys = ("spe", "atk")                               # Shift Gear: Speed first (Showdown's order)
+    elif boosts == {"def": -1, "spd": -1, "spe": -1}:
+        keys = ("spe", "def", "spd")                        # V-create
     elif len(keys) == 5 and len(set(boosts.values())) > 1:
         raise Unsupported("Shell Smash's stat order")
     return [(k, boosts[k]) for k in keys]
@@ -1653,6 +1666,8 @@ def callbacks(b, battle=None, acts=()):
             item.discard("onBasePower")                     # Battle.damage applies it
         if b.item == FOCUS_SASH:
             item.discard("onDamage")                        # use() refuses the hit it would survive
+        if b.item == LIFE_ORB:
+            item -= {"onModifyDamage", "onAfterMoveSecondarySelf"}   # Battle.damage and use() apply them
         live |= item - INERT | item & {"onUpdate"}       # a berry eats on its update
     return live
 
@@ -2015,6 +2030,7 @@ TURN = 4                    # a turn ends every fourth command round
 RESIDUALS = (36, 21, 18, 5, 4, 9, 10, 8, 46, 43, 48, 11, 12, 23, 13, 31, 33, 15, 19, 29, 30, 38, 37, 39, 40, 41,
              24, 45, 14, 20, 1, 2, 3, 7, 6, 16, 17, 22, 25, 26, 27, 28, 32, 34, 35)
 LEFTOVERS = 234
+LIFE_ORB = 270
 UNNERVE_ID = 127
 MOODY = 141                 # idle in a round, acts at a turn's end
 SPEED_BOOST = 3
