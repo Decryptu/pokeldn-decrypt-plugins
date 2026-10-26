@@ -145,7 +145,8 @@ class Battle:
         self.fresh = set()                              # battlers revived since the last turn end
         self.charged = set()
         self.spent = {}
-        self.focused = set()                            # battlers under Focus Energy
+        self.focused = set()
+        self.stockpile = collections.Counter()          # battler -> Stockpile layers                            # battlers under Focus Energy
         self.spreading = False                          # a spread move's hits are being computed
         self.orb = collections.Counter()                # battler -> moves begun since its orb was last drained                                 # battler -> PP its current move spent (0x05)                            # battlers Wind Power charged (their next Electric move)
         self.sides = {0: {}, 1: {}}                     # side (0 players, 1 boss) -> {condition: [turns left, setter]}
@@ -782,7 +783,7 @@ def status_move(battle, move):
         return move
     if move["name"].split()[0] in TERRAINS and move["callbacks"] == ["condition", "terrain"]:
         return move
-    if move["name"] in ("Tailwind", "Focus Energy"):
+    if move["name"] in ("Tailwind", "Focus Energy", "Stockpile"):
         return move
     if move.get("status") in STATUS and not any(k in move for k in ("self", "volatileStatus", "boosts",
                                                                       "secondary", "secondaries")):
@@ -987,11 +988,18 @@ def spread_status(battle, actor, number, move):
 
 
 def focus_energy(battle, actor, number, position, move):
-    """Focus Energy: a status move on its user whose effect is condition 9, 0x1e (A, 9), 0x7d (9, A, 0, 0)
-    and message 336, its critical hits two stages up from then on."""
-    if actor in battle.focused:
+    """Focus Energy or Stockpile, status moves on their user. Focus Energy's effect is condition 9, 0x1e (A,
+    9), 0x7d (9, A, 0, 0) and message 336, its critical hits two stages up from then on; Stockpile's first
+    layer is 0x35 (A, 0, 1), message 236 (A, 1), +1 Defense then 0x35 (A, 1, 1), +1 Special Defense then
+    0x35 (A, 2, 1)."""
+    if move["name"] == "Stockpile":
+        if battle.stockpile[actor] or battle.stages[actor][2] == 6 or battle.stages[actor][4] == 6:
+            raise Unsupported("Stockpile's second layer or at +6")
+        battle.stockpile[actor] += 1
+    elif actor in battle.focused:
         raise Unsupported("Focus Energy again")
-    battle.focused.add(actor)
+    else:
+        battle.focused.add(actor)
     mtype = TYPES.index(move["type"])
     q = b""
     if actor != BOSS:
@@ -1001,7 +1009,14 @@ def focus_energy(battle, actor, number, position, move):
     q += queue.encode(0x7B, (number, battle.rounds, actor)) + queue.encode_group(0xCF, bytes(20))
     q += queue.encode(0x7E, (0, 0, 0, 0, 0, 0)) + queue.encode(0x7E, (1, 0, 0, 0, 0, 0)) + queue.encode(0x7E, (2, 7, 7, 7, 7, 7))
     q += queue.encode(0x8B, (POSITION[actor], POSITION[actor], number, mtype, 0, 0, 0, 0, 7, 0))
-    q += queue.encode(0x1E, (actor, 9)) + queue.encode(0x7D, (9, actor, 0, 0)) + message(0, 336, actor)
+    if move["name"] == "Stockpile":
+        q += queue.encode(0x35, (actor, 0, 1)) + message(0, 236, actor, 1)
+        for i, stat in enumerate((2, 4), 1):
+            battle.stages[actor][stat] += 1
+            q += queue.encode(0x0C, (actor, stat, 1)) + queue.encode(0x92, (actor, stat, 1, 0))
+            q += message(actor, RAISE_TEXT[1] + stat, actor) + queue.encode(0x35, (actor, i, 1))
+    else:
+        q += queue.encode(0x1E, (actor, 9)) + queue.encode(0x7D, (9, actor, 0, 0)) + message(0, 336, actor)
     q += queue.encode(0x7C, ()) + pp(battle, 0x08, actor, number)
     q += queue.encode(0x1D, (actor, position, mtype, 1, 0, number, number))
     return q + queue.encode(0x5B, (actor, number)) * 2 + queue.encode(0x1E, (actor, 0))
@@ -1017,7 +1032,7 @@ def status_use(battle, actor, number, position):
         return weather_use(battle, actor, number, position, move)
     if position == 10 and move["target"] == "allAdjacentFoes":
         return spread_status(battle, actor, number, move)
-    if move["name"] == "Focus Energy":
+    if move["name"] in ("Focus Energy", "Stockpile"):
         return focus_energy(battle, actor, number, position, move)
     own = move["target"] == "self"
     target = actor if own else BATTLER_AT[position]
@@ -1281,6 +1296,7 @@ def player_down(battle, victim, actor, number, quiet=False):
     battle.confused.pop(victim, None)
     battle.charged.discard(victim)
     battle.focused.discard(victim)
+    battle.stockpile.pop(victim, None)
     for e in battle.entries:
         if e.actor == victim:
             e.done = True                                   # its actions are marked run
