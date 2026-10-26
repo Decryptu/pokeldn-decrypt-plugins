@@ -144,6 +144,7 @@ class Battle:
         self.fresh = set()                              # battlers revived since the last turn end
         self.charged = set()
         self.spent = {}
+        self.spreading = False                          # a spread move's hits are being computed
         self.orb = collections.Counter()                # battler -> moves begun since its orb was last drained                                 # battler -> PP its current move spent (0x05)                            # battlers Wind Power charged (their next Electric move)
         self.sides = {0: {}, 1: {}}                     # side (0 players, 1 boss) -> {condition: [turns left, setter]}
         self.weather_left = 0                           # turn ends until the weather ends (0x79's 5)
@@ -290,6 +291,8 @@ class Battle:
             power = modify(power, own)
         power = self.power(actor, move, power)
         base = (2 * a.level // 5 + 2) * power * att // dfn // 50 + 2
+        if self.spreading:
+            base = modify(base, 0.75)                       # Showdown modifyDamage: a spread hit
         if move["type"] in ("Fire", "Water") and self.field & {"sun", "rain"}:
             strong = ("sun" in self.field) == (move["type"] == "Fire")
             base = modify(base, 1.5 if strong else 0.5)     # Showdown conditions.ts: onWeatherModifyDamage
@@ -366,6 +369,8 @@ def use(battle, actor, number, position):
     move = plain(MOVES.get(number))
     if number in UNSEEN_MOVES:
         raise Unsupported(f"move {number} was never probed")
+    if position == 10:
+        return spread(battle, actor, number, move)
     target = BATTLER_AT[position]
     r = battle.rng
     if not battle.hp[target]:
@@ -437,6 +442,90 @@ def use(battle, actor, number, position):
     q += queue.encode(0x5B, (actor, number)) * 2
     q += queue.encode(0x1E, (actor, 0))
     return q
+
+
+SPREAD_TEXT = {(True, 1): 2, (True, 2): 3, (False, 1): 6, (False, 2): 7}   # super effective / resisted, on n targets
+
+
+def spread(battle, actor, number, move):
+    """The boss's extra-action move on every standing player (allAdjacentFoes, position 10): an accuracy
+    draw per target, then per target its critical hit and roll (Showdown's 0.75 spread damage), one hit
+    record (class 5) over them, the damage commands target by target, the effectiveness messages, the
+    0x42s, then each target's secondaries and Sand Spit."""
+    r = battle.rng
+    targets = [b for b in sorted(POSITION, key=POSITION.get) if b != BOSS and battle.hp[b]]
+    if not targets or "contact" in move["flags"] or "recoil" in move or "drain" in move or "multihit" in move:
+        raise Unsupported("a spread move of this kind")
+    for t in targets:
+        if battle.effectiveness(move["type"], t) == 0 or move["type"] == "Ground" and (
+                battle.b[t].ability == LEVITATE or battle.b[t].item == AIR_BALLOON):
+            raise Unsupported("a spread move a target is immune to")
+        if battle.b[t].ability in (STURDY, SHIELDS_DOWN, RATTLED) or battle.b[t].item in (FOCUS_SASH, AIR_BALLOON):
+            raise Unsupported("a spread move into an ability or item that answers it")
+    for t in targets:
+        if type(move["accuracy"]) is int and not r.chance(accuracy(battle, actor, move, t)):
+            raise Unsupported("a spread move missing a target")
+    hits = []
+    battle.spreading = True
+    try:
+        for t in targets:
+            crit = battle.b[t].ability not in CRIT_GUARD and r.below(CRIT_DRAW[move.get("critRatio", 1)]) == 0
+            roll = r.below(16)
+            dmg = battle.damage(actor, t, move, roll, crit)
+            if dmg >= battle.hp[t]:
+                raise Unsupported("a spread move knocking a player out")
+            hits.append((t, crit, dmg, EFFECTIVENESS[battle.effectiveness(move["type"], t)]))
+    finally:
+        battle.spreading = False
+    if sum(c for t, c, d, e in hits) > 1:
+        raise Unsupported("a spread move with two critical hits")
+    mtype, cat = TYPES.index(move["type"]), 1 if move["category"] == "Physical" else 2
+    hit, crits, codes = [0] * 5, [0] * 5, [7] * 5
+    for t, crit, dmg, code in hits:
+        hit[POSITION[t]], crits[POSITION[t]], codes[POSITION[t]] = 1, int(crit), code
+    q = pp(battle, 0x07, actor, number) + queue.encode(0xC9, (actor, 0, number, 10, 0))
+    q += queue.encode(0x7B, (number, battle.rounds, actor))
+    for size in (20, 5, 5, 5, 19, 20):
+        q += queue.encode_group(0xCF, bytes(size))
+    q += queue.encode(0x7E, (0, *hit)) + queue.encode(0x7E, (1, *crits)) + queue.encode(0x7E, (2, *codes))
+    q += queue.encode(0x8B, (POSITION[actor], 10, number, mtype, 0, 0, 1, int(battle.tera_move(actor, move)), 5, 0))
+    if any(c for t, c, d, e in hits):
+        q += queue.encode(0x37, (actor, 0, 1))
+    for t, crit, dmg, code in hits:
+        battle.hp[t] -= dmg
+        q += queue.encode(0x37, (t, 2, dmg)) + queue.encode(0x37, (t, 5, 1))
+    q += b"".join(queue.encode(0x02, (t, actor, dmg, 3)) for t, crit, dmg, code in hits)
+    q += queue.encode(0xD0, bytes(x for t, crit, dmg, code in hits for x in (t, code)))
+    strong = [t for t, c, d, code in hits if code > 7]
+    weak = [t for t, c, d, code in hits if code < 7]
+    if weak and not strong:
+        raise Unsupported("a spread move resisted with none super effective")
+    q += queue.encode(0x8E, (len(hits), 2 if strong else 1, number))
+    for good, ts in ((True, strong), (False, weak)):
+        if ts:
+            if (good, len(ts)) not in SPREAD_TEXT:
+                raise Unsupported("a spread move's effectiveness on three targets")
+            q += message(actor, SPREAD_TEXT[good, len(ts)], *ts)
+    if strong:
+        q += queue.encode(0x20, (actor, 24))
+    for t, crit, dmg, code in hits:
+        if crit:
+            q += queue.encode(0xA7, (POSITION[t], 132)) + queue.encode(0x20, (actor, 26))
+    for t, crit, dmg, code in hits:
+        q += queue.encode(0x42, (t, actor, POSITION[actor], mtype, cat, number, dmg))
+    for t, crit, dmg, code in hits:
+        for sec in secondaries(move):
+            if set(sec) != {"chance", "boosts"}:
+                raise Unsupported("a spread move's secondary")
+            if r.chance(sec["chance"]):
+                q += stat_drop(battle, actor, t, sec["boosts"])
+    for t, crit, dmg, code in hits:
+        if battle.b[t].ability == SAND_SPIT:
+            q += sand_spit(battle, t)
+    q += queue.encode(0xD1, bytes([1, 0])) + queue.encode(0x2E, (2, actor - 1)) + queue.encode(0x7C, ())
+    q += pp(battle, 0x08, actor, number)
+    q += queue.encode(0x1D, (actor, 10, mtype, 1, 0, number, number))
+    return q + queue.encode(0x5B, (actor, number)) * 2 + queue.encode(0x1E, (actor, 0))
 
 
 def accuracy(battle, actor, move, target):
@@ -1479,6 +1568,8 @@ def raid_target(battle, number):
         return 10
     if target in ("self", "adjacentAllyOrSelf"):
         return POSITION[BOSS]
+    if target == "allAdjacentFoes" and move.get("category") != "Status":
+        return 10                                           # every standing player (spread)
     if target not in ("normal", "any", "randomNormal"):
         raise Unsupported(f"an extra action's move aimed at {target}")
     standing = [b for b in sorted(POSITION, key=POSITION.get) if b != BOSS and battle.hp[b]]

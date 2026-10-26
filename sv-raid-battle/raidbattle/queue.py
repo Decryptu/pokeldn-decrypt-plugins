@@ -4,7 +4,7 @@ from +0x23c (pokeldn docs/sv_raid.md, The server command queue).
 A command is its id as a big-endian u16, then its arguments packed by the id's format as one
 big-endian bit stream, padded at the front to whole bytes. Ids 0xce to 0xd4 have their own bodies:
 0xcf and 0xd2 are groups (a u8 byte count, then that many bytes of nested commands), 0xd0 is a u8
-count and that many bytes (at most 4), 0xd1 two bytes, 0xd3 one byte, 0xd4 nothing.
+count and that many bytes (a battler and its effectiveness code per target), 0xd1 two bytes, 0xd3 one byte, 0xd4 nothing.
 """
 
 # format byte -> argument widths in bits, in argument order
@@ -99,8 +99,8 @@ def encode(command, args=()):
             raise ValueError(f"command {command:#x} takes {RAW[command]} bytes")
         return command.to_bytes(2, "big") + bytes(args)
     if command == LIST:
-        if len(args) > 4:
-            raise ValueError("command 0xd0 takes at most 4 bytes")
+        if len(args) > 10:
+            raise ValueError("command 0xd0 takes at most 10 bytes")     # a (battler, code) pair per target
         return command.to_bytes(2, "big") + bytes([len(args)]) + bytes(args)
     widths = FORMATS[COMMAND_FORMAT[command]]
     if len(args) != len(widths):
