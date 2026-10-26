@@ -387,8 +387,11 @@ def plain(move):
     if move.get("isNonstandard") in ("Past", "LGPE", "Gmax", "Future"):
         raise Unsupported(f"{move['name']} is not a Scarlet / Violet move")   # its game data differs
     for key in ("self", "volatileStatus", "status", "boosts"):
+        if key == "self" and key in move and set(move["self"]) == {"boosts"} and \
+                all(v < 0 for v in move["self"]["boosts"].values()):
+            continue                                        # Close Combat and kin: strike() drops the user's stats
         if key in move:
-            raise Unsupported(f"a move with {key}")
+            raise Unsupported(f"a move with {key}: {move['name']}")
     if set(move["callbacks"]) - IDLE_MOVE_CALLBACKS.get(move["name"], set()) and move["name"] not in IDLE_WHEN:
         raise Unsupported(f"{move['name']}'s {move['callbacks'][0]}")
     # "any": one target, any position; a spread move hits only the commanded position in a raid
@@ -763,6 +766,11 @@ def strike(battle, actor, target, number, move, code, i, hits):
         battle.stages[target][5] += 1
         q += queue.encode(0x25, (target,)) + queue.encode(0xC7, (target, 0)) + queue.encode(0x0C, (target, 5, 1))
         q += queue.encode(0x92, (target, 5, 1, 0)) + message(target, 15, target) + queue.encode(0xC8, (target,))
+    if "self" in move and not knockout:                     # the user's own drop, before the secondaries
+        if secondaries(move):
+            raise Unsupported("a self drop beside secondaries")     # their draw order is unmeasured
+        r.chance(100)                                       # drawn as a secondary's chance
+        drops = stat_drop(battle, actor, actor, move["self"]["boosts"], secondary=False, own=True) + drops
     q += drops + contact + spit
     if "drain" in move:
         n, d = move["drain"]
@@ -1211,17 +1219,19 @@ CLEAR_BODIES = frozenset({29, 73, 230})                     # Clear Body, White 
 DEFIANT, COMPETITIVE = 128, 172                             # answer a foe's drop: +2 Attack, +2 Special Attack
 
 
-def stat_drop(battle, actor, target, boosts, secondary=True):
+def stat_drop(battle, actor, target, boosts, secondary=True, own=False):
     """A stat drop on the target: 0x0d and 0x93 (target, stat, stages), then message 31 + stat for one
     stage, 38 + stat for two, from the attacker. Clear Body and its kin block a secondary's drop silently;
     Defiant and Competitive answer a foe's drop of one stat with +2 inside their activation."""
     b = battle.b[target]
     breaker = battle.b[actor].ability in MOLD_BREAKERS
-    if b.ability in CLEAR_BODIES and not breaker and boosts:
+    if own and (b.ability in (126, 86, 109) or any(battle.stages[target][STATS[k]] - (-d) < -6 for k, d in boosts.items())):
+        raise Unsupported("a self drop under Contrary or Simple, or past -6")
+    if b.ability in CLEAR_BODIES and not breaker and boosts and not own:
         if not secondary:
             raise Unsupported("Clear Body against a status move")
         return b""
-    answer = b.ability in (DEFIANT, COMPETITIVE) and (actor == BOSS) != (target == BOSS)
+    answer = b.ability in (DEFIANT, COMPETITIVE) and (actor == BOSS) != (target == BOSS) and not own
     item = set() if b.item in (0, *IDLE_ITEMS) else set(ITEMS.get(str(b.item), ["unknown"]))
     ability = set() if b.ability in INTIMIDATE_ONLY | set(STAT_GUARD) | CLEAR_BODIES | {DEFIANT, COMPETITIVE} \
         else set(ABILITIES.get(str(b.ability), ["unknown"]))
