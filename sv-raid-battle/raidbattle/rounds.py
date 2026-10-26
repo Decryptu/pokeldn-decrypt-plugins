@@ -485,8 +485,9 @@ def strike(battle, actor, target, number, move, code, i, hits):
         raise Unsupported("Shields Down at half HP")
     knockout = target == BOSS and dmg == battle.hp[target]
     faint = target != BOSS and dmg == battle.hp[target]
-    if faint and (battle.b[target].item == AIR_BALLOON or battle.b[target].ability in (RATTLED, SAND_SPIT)):
-        raise Unsupported("a knockout beside an item or ability that answers the hit")
+    rattled = battle.b[target].ability == RATTLED and move["type"] in ("Bug", "Dark", "Ghost")
+    if faint and (rattled or battle.b[target].ability == SAND_SPIT and "sand" not in battle.field):
+        raise Unsupported(f"a knockout beside an item or ability that answers the hit: {battle.b[target].item} {battle.b[target].ability}")
     if knockout or faint:
         r.chance(0)                                         # drawn by every hit that knocks a battler out
     drops = b""
