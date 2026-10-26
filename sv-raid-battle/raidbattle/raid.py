@@ -63,9 +63,11 @@ class Raid:
         return out
 
     def run(self, battle, kind, value):
-        """The record's event for a run action; False for an extra action that already ran."""
+        """The record's event for a run action; False for an extra action or a shield that already ran."""
         from raidbattle.battlers import BOSS
-        if kind == SHIELD and not self.state:
+        if kind == SHIELD:
+            if self.state:
+                return False            # queued again behind the one that ran: shows nothing
             self.state, self.shield_from = 1, battle.hp[BOSS]
         elif kind == SHIELD_END and self.state == 1:
             self.state = 2

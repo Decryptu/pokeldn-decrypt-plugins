@@ -308,10 +308,12 @@ def use(battle, actor, number, position):
     r = battle.rng
     if "sand" in battle.field and move["name"] in SAND_MOVES:
         raise Unsupported("a move the weather changes")
-    if move["type"] == "Ground" and battle.b[target].ability == LEVITATE:
-        raise Unsupported("a Ground move into Levitate")
     if battle.effectiveness(move["type"], target) == 0:
         return immune(battle, actor, target, number, move, position)
+    if move["type"] == "Ground" and battle.b[target].ability == LEVITATE:
+        if battle.b[actor].ability in MOLD_BREAKERS:
+            raise Unsupported("a Ground move into Levitate under Mold Breaker")
+        return immune(battle, actor, target, number, move, position, levitate=True)
     if type(move["accuracy"]) is int and (battle.stages[actor][6] or battle.stages[target][7]):
         raise Unsupported("an accuracy or evasion stage")
     if type(move["accuracy"]) is int and not r.chance(accuracy(battle, actor, move)):
@@ -539,10 +541,11 @@ def recoil(battle, actor, move, dmg, knockout):
     return q + message(actor, 127, actor) + queue.encode(0x37, (actor, 4, r))
 
 
-def immune(battle, actor, target, number, move, position, missed=False, floor=False):
+def immune(battle, actor, target, number, move, position, missed=False, floor=False, levitate=False):
     """A damaging move the target's types are immune to (no draw), or one that missed: five zero groups,
     message 72 and 0x52 (A, 3), or message 73 and 0x52 (A, 1); a stat-dropping move into stats all at -6
-    (`floor`, no draw): message 60 alone."""
+    (`floor`, no draw): message 60 alone; a Ground move into Levitate (no draw): message 72 about the target
+    inside its ability's activation, 0x25 (T), 0xc7 (T, 0) ... 0xc8 (T)."""
     mtype = TYPES.index(move["type"])
     q = b""
     if actor != BOSS:
@@ -553,6 +556,9 @@ def immune(battle, actor, target, number, move, position, missed=False, floor=Fa
         q += queue.encode_group(0xCF, bytes(size))
     if floor:
         q += message(actor, 60, target)
+    elif levitate:
+        q += queue.encode(0x25, (target,)) + queue.encode(0xC7, (target, 0)) + message(target, 72, target)
+        q += queue.encode(0xC8, (target,)) + queue.encode(0x52, (actor, 3))
     else:
         q += message(actor, 73 if missed else 72, target) + queue.encode(0x52, (actor, 1 if missed else 3))
     q += pp(battle, 0x08, actor, number)
@@ -681,7 +687,7 @@ def raise_stats(battle, b, boosts):
             set(ITEMS.get(str(x.item), ["unknown"])) & (BOOST_ANSWERS | {"onUpdate"}):
         raise Unsupported(f"battler {b}'s ability {x.ability} or item {x.item} answers a stat raise")
     q = b""
-    for key, n in boosts.items():
+    for key, n in sorted(boosts.items(), key=lambda kv: STATS[kv[0]]):     # in stat order (Coil)
         stat = STATS[key]
         if n not in RAISE_TEXT or battle.stages[b][stat] + n > 6:
             raise Unsupported("a stat raise past +6 or of more than 3 stages")
@@ -779,7 +785,7 @@ def stat_drop(battle, actor, target, boosts):
     if ability & BOOST_ANSWERS or item & (BOOST_ANSWERS | {"onUpdate"}):
         raise Unsupported(f"battler {target}'s ability {b.ability} or item {b.item} answers a stat drop")
     q = b""
-    for key, delta in boosts.items():
+    for key, delta in sorted(boosts.items(), key=lambda kv: STATS[kv[0]]):
         stat, n = STATS[key], -delta
         if STAT_GUARD.get(b.ability) == stat:
             raise Unsupported(f"battler {target}'s ability {b.ability} guards stat {stat}")
@@ -1319,7 +1325,6 @@ def raid_round(battle, words):
     q = run_actions(battle, entries)
     won = not battle.hp[BOSS]
     q += round_end(battle, entries, [BOSS], won, False)
-    battle.raid.pending = []
     body = bytes(block) + struct.pack("<I", len(q)) + q
     return body + bytes(BODY - len(body)), won
 
