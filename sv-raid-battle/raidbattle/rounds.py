@@ -2014,8 +2014,6 @@ def weather_check(battle, acts):
 def terrain_check(battle, acts):
     """Refuses what a terrain changes and nothing here builds: Grassy Terrain's heal, Psychic Terrain
     stopping a priority move."""
-    if battle.terrain == "Grassy":
-        raise Unsupported("Grassy Terrain")
     if any(x.ability in TERRAIN_READERS or x.item in TERRAIN_ITEMS for x in battle.b.values()):
         raise Unsupported("an ability or item reads the terrain")
     for actor, number, position in acts:
@@ -2052,7 +2050,7 @@ def turn_end(battle, order):
     q = queue.encode(0xC5, (0,)) + queue.encode(0x50, (0,)) + weather_end(battle)
     if "sand" in battle.field:
         q += sandstorm(battle, order)
-    q += leftovers(battle, order)
+    q += grassy(battle, order) + leftovers(battle, order)
     for b in order:
         if battle.b[b].ability == 61 and battle.hp[b] and battle.status.get(b) and battle.rng.chance(33):
             raise Unsupported("Shed Skin curing a status")  # chance(33) while statused; a cure is unmeasured
@@ -2090,6 +2088,25 @@ def turn_end(battle, order):
             battle.stages[b][5] += 1                        # Speed Boost: +1 Speed after the turn's end
             q += queue.encode(0x25, (b,)) + queue.encode(0xC7, (b, 0)) + queue.encode(0x0C, (b, 5, 1))
             q += queue.encode(0x92, (b, 5, 1, 0)) + message(b, 15, b) + queue.encode(0xC8, (b,))
+    return q
+
+
+def grassy(battle, order):
+    """Grassy Terrain's heal at a turn's end, right after the weather's commands, in speed order: a
+    sixteenth of the record HP to each grounded battler below its maximum: 0xa7 (b's position, 51), 0x03
+    (b, heal), 0x9a (b, heal), 0xcb (b, 130, b)."""
+    if battle.terrain != "Grassy":
+        return b""
+    q = b""
+    for b in order:
+        if not battle.hp[b] or battle.hp[b] >= battle.full[b] or not battle.grounded(b):
+            continue
+        if b in battle.healblock:
+            raise Unsupported("Grassy Terrain under Heal Block")
+        heal = max(1, battle.b[b].stats[0] // 16)
+        battle.hp[b] = min(battle.full[b], battle.hp[b] + heal)
+        q += queue.encode(0xA7, (POSITION[b], 51)) + queue.encode(0x03, (b, heal)) + queue.encode(0x9A, (b, heal))
+        q += message(b, 130, b)
     return q
 
 
