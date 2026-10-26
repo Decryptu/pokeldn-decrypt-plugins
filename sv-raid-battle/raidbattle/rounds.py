@@ -1409,8 +1409,8 @@ def round_end(battle, entries, acted, won, counted):
     sort's order, 0x23 for each battler revived since the last round then each that acted, 0x2d."""
     n = (battle.turns + 1) % TURN if counted else None
     # a round ends with three battler sorts, the second the 0x43 order; a turn's end with eight, the
-    # fourth or fifth its residual order (no tie told them apart), the seventh, after the turn's end, the
-    # 0x43 order (a Speed Boost there already counts)
+    # fourth its residual order, the seventh, after the turn's end, the 0x43 order (a Speed Boost there
+    # already counts)
     ends = [speed_order(battle, standing(battle), battle.speed) for _ in range(3 if won or n != 0 else 5)]
     if won and len({battle.speed(b) for b in battle.b}) != len(battle.b):
         raise Unsupported("a speed tie in the winning round")
@@ -1421,9 +1421,7 @@ def round_end(battle, entries, acted, won, counted):
         if counted:
             q += queue.encode(0x75, (3, n))
         if n == 0:
-            if ends[3] != ends[4] or "sand" in battle.field and len({tuple(e) for e in ends[1:6]}) > 1:
-                raise Unsupported("a speed tie at a turn's end")
-            q += turn_end(battle, ends[3])
+            q += turn_end(battle, ends[3])                  # the fourth sort, ties and all
             ends += [speed_order(battle, standing(battle), battle.speed) for _ in range(3)]
         q += queue.encode(0xC5, (1,))
     q += b"".join(queue.encode(0x43, (b,)) for b in ends[1 if won or n != 0 else 6] if battle.hp[b])
