@@ -40,6 +40,7 @@ IDLE_MOVE_CALLBACKS = {"Facade": {"onBasePower"}, "Venoshock": {"onBasePower"}, 
                        "Rising Voltage": {"basePowerCallback"}, "Sunsteel Strike": {"ignoreAbility"},
                        "Moongeist Beam": {"ignoreAbility"}, "Salt Cure": {"condition"},
                        "False Swipe": {"onDamage", "onDamagePriority"}, "Secret Sword": {"overrideDefensiveStat"},
+                       "Psyshock": {"overrideDefensiveStat"}, "Psystrike": {"overrideDefensiveStat"},
                        "Chip Away": {"ignoreDefensive", "ignoreEvasion"}, "Sacred Sword": {"ignoreDefensive", "ignoreEvasion"},
                        "Darkest Lariat": {"ignoreDefensive", "ignoreEvasion"}}
 # moves whose own callback does nothing in the round at hand (Showdown moves.ts): use() refuses the others
@@ -278,7 +279,7 @@ class Battle:
         a, d = self.b[actor], self.b[target]
         physical = move["category"] == "Physical"
         # a critical hit ignores the user's lowered and the target's raised stages (Showdown getDamage)
-        hits_def = physical or move.get("overrideDefensiveStat") == "def" or move["name"] == "Secret Sword"
+        hits_def = physical or move["name"] in ("Secret Sword", "Psyshock", "Psystrike")
         ast, dst = self.stages[actor][1 if physical else 3], self.stages[target][2 if hits_def else 4]
         if crit:
             ast, dst = max(ast, 0), min(dst, 0)
@@ -382,7 +383,7 @@ def pp(battle, command, actor, number):
 
 def plain(move):
     if move is None or move["category"] == "Status" or not move.get("basePower"):
-        raise Unsupported("not a damaging move")
+        raise Unsupported(f"not a damaging move: {move and move['name']}")
     if move.get("isNonstandard") in ("Past", "LGPE", "Gmax", "Future"):
         raise Unsupported(f"{move['name']} is not a Scarlet / Violet move")   # its game data differs
     for key in ("self", "volatileStatus", "status", "boosts"):
@@ -396,7 +397,8 @@ def plain(move):
     if move.get("critRatio", 1) not in CRIT_DRAW:
         raise Unsupported("crit stage")
     for sec in secondaries(move):
-        if set(sec) - {"chance", "status", "volatileStatus", "boosts"} or "chance" not in sec or len(sec) == 1:
+        if set(sec) - {"chance", "status", "volatileStatus", "boosts", "self"} or "chance" not in sec or len(sec) == 1 \
+                or "self" in sec and set(sec["self"]) != {"boosts"}:
             raise Unsupported(f"secondary of {move['name']}: {sorted(sec)}")
     return move
 
@@ -676,7 +678,7 @@ def strike(battle, actor, target, number, move, code, i, hits):
             turns = 2 + r.duration(4)                       # the duration, drawn before the chance
         elif sec.get("status") == "slp":
             turns = 2 + r.duration(3)
-        if r.chance(sec["chance"]) and not faint:          # a fainted player draws a flinch or confusion
+        if r.chance(sec["chance"]) and (not faint or "self" in sec):   # a fainted player draws a flinch or confusion
             if sec.get("volatileStatus") == "flinch":
                 if target not in battle.moved:
                     battle.flinched.add(target)             # stops its move this round
@@ -686,6 +688,9 @@ def strike(battle, actor, target, number, move, code, i, hits):
                 continue
             if sec.get("volatileStatus") == "confusion" and set(sec) == {"chance", "volatileStatus"} and not knockout:
                 drops += confuse(battle, actor, target, turns)
+                continue
+            if set(sec) == {"chance", "self"} and not knockout:
+                drops += raise_stats(battle, actor, sec["self"]["boosts"])     # Flame Charge and kin: the user
                 continue
             if sec.get("volatileStatus") == "saltcure" and not knockout:
                 if target in battle.salted:
@@ -1129,9 +1134,12 @@ def status_use(battle, actor, number, position):
         stat_drop(battle, actor, target, {}, secondary=False)   # what answers a drop still refuses
         return immune(battle, actor, target, number, move, position, floor=True)
     r = battle.rng
+    turns = 2 + r.duration(3) if move.get("status") == "slp" else 0     # drawn before the accuracy, as a secondary's
     if type(move["accuracy"]) is int:
         if not r.chance(accuracy(battle, actor, move, target) if not own else move["accuracy"]):
-            raise Unsupported("a miss")
+            if own:
+                raise Unsupported("a self-targeted status move missing")
+            return immune(battle, actor, target, number, move, position, missed=True)   # as a damaging miss
     apos, tpos = POSITION[actor], POSITION[target]
     q = b""
     if actor != BOSS:
@@ -1146,7 +1154,6 @@ def status_use(battle, actor, number, position):
     q += queue.encode(0x8B, (apos, tpos, number, TYPES.index(move["type"]), 0, 0, 0, 0,
                              7 if own else TARGET_CLASS.get(move["target"], 0), 0))
     if move.get("status"):
-        turns = 2 + r.duration(3) if move["status"] == "slp" else 0
         q += inflict(battle, actor, target, move["status"], turns)
     elif own:
         q += raise_stats(battle, actor, move["boosts"])
