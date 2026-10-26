@@ -64,7 +64,7 @@ def raid_words(body):
 def timed(battle, words):
     """Whether the boss's time triggers give `words` at some time left on the battle timer."""
     r = battle.raid
-    return any(r.triggers(battle, left) == words for left in range(r.limit, -600, -1))
+    return any(r.triggers(battle, lambda: left) == words for left in range(r.limit, -600, -1))
 
 
 def check_rounds(d):

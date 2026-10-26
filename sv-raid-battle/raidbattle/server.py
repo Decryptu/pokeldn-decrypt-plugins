@@ -28,29 +28,57 @@ class Unsupported(Exception):
     over and the console fights its own battle."""
 
 
+class Clock:
+    """The machine's clock in ticks of the 19.2 MHz system counter (pokeldn docs/sv_raid.md, The server's
+    flow): each frame moves it to the frame's time if that is later, and every read adds 256 ticks, so a
+    timer ending on a whole second ends on the frame whose read comes after its start's."""
+
+    def __init__(self, now):
+        self.origin, self.ticks = now, 0
+
+    def frame(self, t):
+        self.ticks = max(self.ticks, round((t - self.origin) * 19200000))
+
+    def read(self):
+        """GetSystemTick, as ns (nn::os::ConvertToTimeSpan)."""
+        self.ticks += 256
+        return self.ticks * 625 // 12
+
+
+def _seconds(ns):
+    """Whole seconds, truncated toward zero."""
+    return ns // 1000000000 if ns >= 0 else -(-ns // 1000000000)
+
+
 class Timer:
-    """A server timer (pokeldn docs/sv_raid.md, The battle timer): seconds run while no pause reason is
-    set; made started and at once paused for reason 0."""
+    """A server timer (pokeldn docs/sv_raid.md, The battle timer): ns run while no pause reason is set;
+    made started and at once paused for reason 0 (0xf70a58), each step reading the clock where the game
+    does."""
 
-    def __init__(self, limit, now):
-        self.limit, self.start, self.acc, self.reasons = limit, None, 0.0, {0}
+    def __init__(self, limit, clock):
+        self.limit, self.clock, self.reasons = limit, clock, {0}
+        start = clock.read()
+        self.acc, self.start = clock.read() - start, None
 
-    def pause(self, now, reason=0):
+    def pause(self, reason=0):
         if not self.reasons:
-            self.acc += now - self.start
+            self.acc += self.clock.read() - self.start
             self.start = None
         self.reasons.add(reason)
 
-    def resume(self, now, reason=0):
+    def resume(self, reason=0):
+        if not self.reasons:
+            return
         self.reasons.discard(reason)
-        if not self.reasons and self.start is None:
-            self.start = now
+        if not self.reasons:
+            self.start = self.clock.read()
 
-    def left(self, now, offset=0):
-        """Seconds left: the limit (plus `offset` while running) less the whole seconds run."""
+    def left(self, offset=0):
+        """Seconds left (0xf91070): the limit (plus `offset` while running) less the whole seconds run
+        and the whole seconds accumulated."""
         if self.reasons:
-            return self.limit - int(self.acc)
-        return self.limit + offset - int(now - self.start) - int(self.acc)
+            return self.limit - _seconds(self.acc)
+        return self.limit + offset - _seconds(self.clock.read() - self.start) - _seconds(self.acc)
 
 
 class Job:
@@ -80,6 +108,7 @@ class Server:
             self.start_body = start_body if start_body is not None else start.body(self.battlers)
         self.rounds = rounds
         self.t = 0.0
+        self.clock = None
         self.step = 0
         self.round = 0
         self.out = {s: [] for s in SLOTS}
@@ -103,8 +132,10 @@ class Server:
 
     def start(self, now):
         self.t = now
+        self.clock = Clock(now)
+        self.clock.frame(now)
         if self.battle is not None:
-            self.timer = Timer(self.battle.raid.limit, now)
+            self.timer = Timer(self.battle.raid.limit, self.clock)
         self.posted.append(Job(self._wild_setup()))
         return self._frame()
 
@@ -112,11 +143,13 @@ class Server:
         moved, t = 0, self.t
         while True:
             self.t = t
+            self.clock.frame(t)
             moved += self._frame()
             t += 1 / FPS
             if t > until:
                 break
         self.t = until
+        self.clock.frame(until)
         return moved
 
     def receive(self, slot, message):
@@ -189,14 +222,14 @@ class Server:
             return False
         if self.timer is not None:
             offset = self.battle.timer_offset
-            if self.timer.left(self.t, offset) <= 0:
+            if self.timer.left(offset) <= 0:
                 self.over = True
                 self.posted.insert(0, Job(self._time_up()))
                 return True
             if self.armed:
                 if self.boss_list:
                     return False
-                words = self.battle.raid.triggers(self.battle, self.timer.left(self.t, offset))
+                words = self.battle.raid.triggers(self.battle, lambda: self.timer.left(offset))
                 if words:
                     self.timed, self.armed = words, False
                     return False
@@ -259,11 +292,11 @@ class Server:
         elif sub == 3:
             if self._erase(slot, FAINTED, FAINTED + 1):
                 wait = REVIVE_WAIT[min(self.battle.faints[b], len(REVIVE_WAIT)) - 1]
-                self.revive_timer[slot] = Timer(wait, self.t)
-                self.revive_timer[slot].resume(self.t)
+                self.revive_timer[slot] = Timer(wait, self.clock)
+                self.revive_timer[slot].resume()
                 self.sub[slot] = 1
         elif sub == 1:
-            if self.revive_timer[slot].left(self.t) < 1:
+            if self.revive_timer[slot].left() < 1:
                 self.posted.append(Job(self._revive(slot)))
                 self.sub[slot] = 2
         elif sub == 2:
@@ -284,9 +317,9 @@ class Server:
         for s in SLOTS:                               # what each slot sent and was sent, cleared
             self.store[s], self.got[s] = [], []
         self.setup = "done"
+        yield                                         # the job ends next frame, starting the battle timer
         if self.timer is not None:
-            self.timer.resume(self.t)
-        yield                                         # the job ends next frame
+            self.timer.resume()
 
     def _request(self, slot):
         self._send(REQUEST, (slot,), destination=slot)
@@ -325,13 +358,13 @@ class Server:
         shield = words[0][0] == 1
         if shield:
             step = self._send(PAUSE, SLOTS)
-            self.timer.pause(self.t)
+            self.timer.pause()
             yield
             while not all(self._answered(s, PAUSE, step) for s in SLOTS):
                 yield
             yield
         body, won = rounds.raid_round(self.battle, words)
-        self.timer.resume(self.t)
+        self.timer.resume()
         self.round += 1
         self._send(ROUND, SLOTS, body)
         yield

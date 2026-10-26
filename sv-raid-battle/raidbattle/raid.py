@@ -32,12 +32,18 @@ class Raid:
 
     def triggers(self, battle, left=None):
         """-> the actions that fire now, in queue order: by HP when `left` is None, else by the time left
-        (seconds) on the battle timer."""
-        out = []
+        on the battle timer, `left()` (seconds) read once for each time check, as the game reads the clock
+        (0xf6dd84)."""
+        out, seconds = [], []
         push = lambda kind, value: len(out) < 4 and out.append((kind, value))
         from raidbattle.battlers import BOSS
         timed = left is not None
-        by_time = lambda pct: not self.limit or left * 100 // self.limit <= pct
+
+        def by_time(pct):
+            if not self.limit:
+                return True
+            seconds.append(left())
+            return seconds[-1] * 100 // self.limit <= pct
         if self.state:
             if not timed and self.state == 1 and self.shield_end and battle.hp[BOSS]:
                 lost = max(0, self.shield_from - battle.hp[BOSS])
@@ -45,7 +51,7 @@ class Raid:
                     push(SHIELD_END, 1)
         elif not self.late:
             if timed and self.shield_time and by_time(self.shield_time):
-                push(SHIELD, self.limit + battle.timer_offset - left)     # the seconds run
+                push(SHIELD, self.limit + battle.timer_offset - seconds[-1])     # the seconds run
             elif not timed and self.shield_hp and battle.hp[BOSS] and self.share(battle) <= self.shield_hp:
                 push(SHIELD, 0)
         if timed and not self.late and by_time(10):
