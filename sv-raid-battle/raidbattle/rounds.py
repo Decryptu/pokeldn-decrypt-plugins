@@ -146,6 +146,7 @@ class Battle:
         self.charged = set()
         self.spent = {}
         self.focused = set()
+        self.trick_left = 0                             # turn ends until Trick Room ends
         self.stockpile = collections.Counter()          # battler -> Stockpile layers                            # battlers under Focus Energy
         self.spreading = False                          # a spread move's hits are being computed
         self.orb = collections.Counter()                # battler -> moves begun since its orb was last drained                                 # battler -> PP its current move spent (0x05)                            # battlers Wind Power charged (their next Electric move)
@@ -184,7 +185,8 @@ class Battle:
         paralysed = self.status.get(battler, (0,))[0] == PAR
         if rush + tail + paralysed > 1:
             raise Unsupported("Speed modifiers chained")
-        return modify(spe, 2) if rush or tail else modify(spe, 0.5) if paralysed else spe
+        spe = modify(spe, 2) if rush or tail else modify(spe, 0.5) if paralysed else spe
+        return TRICK_ROOM_TOP - spe if self.trick_left else spe     # Trick Room turns the order around
 
     def grounded(self, b):
         """Showdown isGrounded, for the effects a raid can reach: not Flying, Levitate or an Air Balloon."""
@@ -783,7 +785,7 @@ def status_move(battle, move):
         return move
     if move["name"].split()[0] in TERRAINS and move["callbacks"] == ["condition", "terrain"]:
         return move
-    if move["name"] in ("Tailwind", "Focus Energy", "Stockpile"):
+    if move["name"] in ("Tailwind", "Focus Energy", "Stockpile", "Trick Room"):
         return move
     if move.get("status") in STATUS and not any(k in move for k in ("self", "volatileStatus", "boosts",
                                                                       "secondary", "secondaries")):
@@ -843,6 +845,7 @@ def terrain_end(battle):
     return q + queue.encode(0xAA, (0,)) + queue.encode(0x69, (8, 0))
 
 
+TRICK_ROOM_TOP = 10000      # Showdown getActionSpeed under Trick Room: 10000 - Speed
 TAILWIND = 4                # a side condition's id in 0x4a, 0x4c, 0x4b, 0x66
 SIDE_TURNS = {TAILWIND: 4}
 SIDE_TEXT = {TAILWIND: (643, 645)}      # start, end
@@ -918,9 +921,14 @@ def weather_use(battle, actor, number, position, move):
     q += queue.encode(0x7E, (0, 0, 0, 0, 0, 0)) + queue.encode(0x7E, (1, 0, 0, 0, 0, 0))
     q += queue.encode(0x7E, (2, 7, 7, 7, 7, 7))
     side = move["name"] == "Tailwind"
-    q += queue.encode(0x8B, (apos, 10 if side else position, number, TYPES.index(move["type"]), 0, 0, 0, 0, 12 if side else 10, 0))
+    q += queue.encode(0x8B, (apos, 10, number, TYPES.index(move["type"]), 0, 0, 0, 0, 12 if side else 10, 0))
     if side:
         q += side_start(battle, actor, TAILWIND)
+    elif move["name"] == "Trick Room":                      # field slot 1 for five turns: 0x69 (1, 0), 0x30 (1, 0, 42, A), message 275
+        if battle.trick_left:
+            raise Unsupported("Trick Room again")
+        battle.trick_left = 5
+        q += queue.encode(0x69, (1, 0)) + queue.encode(0x30, (1, 0, 42, actor)) + message(actor, 275, actor)
     elif move["name"] in WEATHER_MOVES:
         q += weather_start(battle, *WEATHER_MOVES[move["name"]], actor)
     else:
@@ -1028,7 +1036,7 @@ def status_use(battle, actor, number, position):
     move = status_move(battle, MOVES[number])
     if number in UNSEEN_MOVES:
         raise Unsupported(f"move {number} was never probed")
-    if move["name"] in WEATHER_MOVES or move["name"].split()[0] in TERRAINS or move["name"] == "Tailwind":
+    if move["name"] in WEATHER_MOVES or move["name"].split()[0] in TERRAINS or move["name"] in ("Tailwind", "Trick Room"):
         return weather_use(battle, actor, number, position, move)
     if position == 10 and move["target"] == "allAdjacentFoes":
         return spread_status(battle, actor, number, move)
@@ -1830,6 +1838,10 @@ def turn_end(battle, order):
         for b in order:
             if battle.hp[b]:
                 q += queue.encode(0x19, (b, k)) + residual(battle, b, k)
+    if battle.trick_left:
+        battle.trick_left -= 1
+        if not battle.trick_left:
+            raise Unsupported("Trick Room ends")           # not in the corpus
     q += side_end(battle)
     q += b"".join(queue.encode(0x44, (k,)) for k in range(1, 9)) + terrain_end(battle)
     q += b"".join(queue.encode(0x44, (k,)) for k in range(9, 14))
