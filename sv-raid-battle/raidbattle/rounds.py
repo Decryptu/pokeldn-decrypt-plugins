@@ -133,6 +133,7 @@ class Battle:
         self.field = set()                              # "sun", "rain", "snow", "sand"
         self.terrain = None                             # "Grassy", "Misty", "Electric", "Psychic"
         self.terrain_left = 0                           # turn ends until the terrain ends
+        self.sides = {0: {}, 1: {}}                     # side (0 players, 1 boss) -> {condition: [turns left, setter]}
         self.weather_left = 0                           # turn ends until the weather ends (0x79's 5)
         self.weather_by = 0                             # the battler that set it (0x01's second argument)
         self.sand_hurt = set()                          # battlers the sandstorm has damaged
@@ -154,15 +155,16 @@ class Battle:
         moves = self.b[battler].moves
         return moves.index(number) if number in moves else None if battler == BOSS else 0
 
-    def speed(self, battler):
+    def speed(self, battler, side=True):
         """The Speed the turn order reads: the stat at its stage, doubled by a weather's speed ability (Swift
         Swim, Chlorophyll, Sand Rush, Slush Rush), halved while paralysed."""
         spe = staged(self.b[battler].speed, self.stages[battler][5])
         rush = SPEED_WEATHER.get(self.b[battler].ability) in self.field
+        tail = side and TAILWIND in self.sides[int(battler == BOSS)]
         paralysed = self.status.get(battler, (0,))[0] == PAR
-        if rush and paralysed:
-            raise Unsupported("a weather's speed ability chained with paralysis")
-        return modify(spe, 2) if rush else modify(spe, 0.5) if paralysed else spe
+        if rush + tail + paralysed > 1:
+            raise Unsupported("Speed modifiers chained")
+        return modify(spe, 2) if rush or tail else modify(spe, 0.5) if paralysed else spe
 
     def grounded(self, b):
         """Showdown isGrounded, for the effects a raid can reach: not Flying, Levitate or an Air Balloon."""
@@ -601,6 +603,8 @@ def status_move(battle, move):
         return move
     if move["name"].split()[0] in TERRAINS and move["callbacks"] == ["condition", "terrain"]:
         return move
+    if move["name"] == "Tailwind":
+        return move
     if move.get("status") in STATUS and not any(k in move for k in ("self", "volatileStatus", "boosts",
                                                                       "secondary", "secondaries")):
         if set(move["callbacks"]) - {"ignoreImmunity"} or move["target"] != "normal":
@@ -659,6 +663,45 @@ def terrain_end(battle):
     return q + queue.encode(0xAA, (0,)) + queue.encode(0x69, (8, 0))
 
 
+TAILWIND = 4                # a side condition's id in 0x4a, 0x4c, 0x4b, 0x66
+SIDE_TURNS = {TAILWIND: 4}
+SIDE_TEXT = {TAILWIND: (643, 645)}      # start, end
+
+
+WIND_ABILITIES = frozenset({274, 277})                     # Wind Rider, Wind Power: Tailwind on their side
+
+
+def side_start(battle, b, cond):
+    """A side condition raised by battler b on its side: 0x4a and 0x65 (side, cond, 0, 34, b), 0xca (b, start
+    text, side)."""
+    side = int(b == BOSS)
+    if cond == TAILWIND and any(x.ability in WIND_ABILITIES for i, x in battle.b.items() if int(i == BOSS) == side):
+        raise Unsupported("Tailwind beside Wind Rider or Wind Power")
+    if cond in battle.sides[side]:
+        raise Unsupported("a side condition already up")
+    battle.sides[side][cond] = [SIDE_TURNS[cond], b]
+    q = queue.encode(0x4A, (side, cond, 0, 34, b)) + queue.encode(0x65, (side, cond, 0, 34, b))
+    return q + queue.encode(0xCA, (b, SIDE_TEXT[cond][0], side, END) + (0,) * 6)
+
+
+def side_end(battle):
+    """At a turn's end, after the residual kinds: 0x4c (side, cond) for each side condition up; at its last
+    turn 0x4b and 0x66 (side, cond) and 0xca (the battler that raised it, end text, side)."""
+    up = [(side, cond) for side in (0, 1) for cond in battle.sides[side]]
+    if len(up) > 1:
+        raise Unsupported("two side conditions at a turn's end")
+    q = b""
+    for side, cond in up:
+        c = battle.sides[side][cond]
+        q += queue.encode(0x4C, (side, cond))
+        c[0] -= 1
+        if not c[0]:
+            del battle.sides[side][cond]
+            q += queue.encode(0x4B, (side, cond)) + queue.encode(0x66, (side, cond))
+            q += queue.encode(0xCA, (c[1], SIDE_TEXT[cond][1], side, END) + (0,) * 6)
+    return q
+
+
 def weather_start(battle, name, w, b):
     """A weather raised by battler b: 0x6a (0), 0x69 (0, w), 0x79 (w, 5, 0, b, 0), 0x88 (w, b, 0)."""
     if battle.field & {"sun", "rain", "snow", "sand"}:
@@ -686,8 +729,11 @@ def weather_use(battle, actor, number, position, move):
     q += queue.encode_group(0xCF, bytes(20))
     q += queue.encode(0x7E, (0, 0, 0, 0, 0, 0)) + queue.encode(0x7E, (1, 0, 0, 0, 0, 0))
     q += queue.encode(0x7E, (2, 7, 7, 7, 7, 7))
-    q += queue.encode(0x8B, (apos, position, number, TYPES.index(move["type"]), 0, 0, 0, 0, 10, 0))
-    if move["name"] in WEATHER_MOVES:
+    side = move["name"] == "Tailwind"
+    q += queue.encode(0x8B, (apos, 10 if side else position, number, TYPES.index(move["type"]), 0, 0, 0, 0, 12 if side else 10, 0))
+    if side:
+        q += side_start(battle, actor, TAILWIND)
+    elif move["name"] in WEATHER_MOVES:
         q += weather_start(battle, *WEATHER_MOVES[move["name"]], actor)
     else:
         q += terrain_start(battle, move["name"].split()[0], actor)
@@ -733,7 +779,7 @@ def status_use(battle, actor, number, position):
     move = status_move(battle, MOVES[number])
     if number in UNSEEN_MOVES:
         raise Unsupported(f"move {number} was never probed")
-    if move["name"] in WEATHER_MOVES or move["name"].split()[0] in TERRAINS:
+    if move["name"] in WEATHER_MOVES or move["name"].split()[0] in TERRAINS or move["name"] == "Tailwind":
         return weather_use(battle, actor, number, position, move)
     own = move["target"] == "self"
     target = actor if own else BATTLER_AT[position]
@@ -1463,6 +1509,7 @@ def turn_end(battle, order):
         for b in order:
             if battle.hp[b]:
                 q += queue.encode(0x19, (b, k)) + residual(battle, b, k)
+    q += side_end(battle)
     q += b"".join(queue.encode(0x44, (k,)) for k in range(1, 9)) + terrain_end(battle)
     q += b"".join(queue.encode(0x44, (k,)) for k in range(9, 14))
     for b in order:
@@ -1549,7 +1596,7 @@ def handler(battle, act, base, last=True):
     actor, number = act[0], act[1]
     if number not in HANDLER_MOVES:
         return b""
-    q = queue.encode(0x5A, (actor, number, base + battle.speed(actor)))
+    q = queue.encode(0x5A, (actor, number, base + battle.speed(actor, side=False)))    # no Tailwind in it
     return q + queue.encode(0x5B, (actor, number)) if last else q
 
 
