@@ -1760,8 +1760,8 @@ def turn_end(battle, order):
     over the battlers in `order` (speed order), 0x44 (1 to 13)."""
     for b in battle.b.values():
         live = callbacks(b, battle) & {"onResidual"}
-        if live and residual_idle(battle, b):
-            live = set()
+        if live and residual_idle(battle, b) or b.ability == 61 and battle.hp[b.id]:
+            live = set()                                    # Shed Skin draws below
         if battle.hp[b.id] and battle.status.get(b.id) and battle.status[b.id][0] not in (BRN, PSN, PAR, FRZ, SLP):
             raise Unsupported(f"battler {b.id}'s status at the turn's end")
         if b.ability == MOODY and battle.hp[b.id]:
@@ -1772,6 +1772,9 @@ def turn_end(battle, order):
     if "sand" in battle.field:
         q += sandstorm(battle, order)
     q += leftovers(battle, order)
+    for b in order:
+        if battle.b[b].ability == 61 and battle.hp[b] and battle.status.get(b) and battle.rng.chance(33):
+            raise Unsupported("Shed Skin curing a status")  # chance(33) while statused; a cure is unmeasured
     for k in RESIDUALS:
         for b in order:
             if battle.hp[b]:
