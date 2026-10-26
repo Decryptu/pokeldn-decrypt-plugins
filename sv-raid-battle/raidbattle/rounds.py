@@ -41,7 +41,7 @@ IDLE_MOVE_CALLBACKS = {"Facade": {"onBasePower"}, "Venoshock": {"onBasePower"}, 
                        "Moongeist Beam": {"ignoreAbility"}, "Salt Cure": {"condition"},
                        "False Swipe": {"onDamage", "onDamagePriority"}, "Secret Sword": {"overrideDefensiveStat"},
                        "Psyshock": {"overrideDefensiveStat"}, "Psystrike": {"overrideDefensiveStat"},
-                       "Steel Beam": {"onMoveFail"},
+                       "Steel Beam": {"onMoveFail"}, "Reversal": {"basePowerCallback"}, "Flail": {"basePowerCallback"},
                        "Chip Away": {"ignoreDefensive", "ignoreEvasion"}, "Sacred Sword": {"ignoreDefensive", "ignoreEvasion"},
                        "Darkest Lariat": {"ignoreDefensive", "ignoreEvasion"}}
 # moves whose own callback does nothing in the round at hand (Showdown moves.ts): use() refuses the others
@@ -57,7 +57,7 @@ IDLE_WHEN = {
     "Scald": lambda b, a, t: b.status.get(t, (0,))[0] != FRZ, 
     "Covet": lambda b, a, t: not b.b[t].item, "Thief": lambda b, a, t: not b.b[t].item,
     "Frost Breath": lambda b, a, t: True, "Wicked Blow": lambda b, a, t: True, "Flower Trick": lambda b, a, t: True,
-    "Surging Strikes": lambda b, a, t: True,
+    "Surging Strikes": lambda b, a, t: True, "Grav Apple": lambda b, a, t: True,      # no Gravity here
 }
 PRESSURE = 46               # a move aimed at it spends 2 PP: 0x05 (b, 0, 2)
 STURDY = 5
@@ -244,11 +244,14 @@ class Battle:
         return m
 
     def stab(self, actor, move_type):
+        adapt = self.b[actor].ability == ADAPTABILITY
         if actor == BOSS and move_type == self.tera:
+            if adapt:                                       # Showdown: Adaptability on a Terastallized user
+                return 2.25 if move_type in self.types[BOSS] else 2.0
             return 2.0 if move_type in self.types[BOSS] else 1.5
         if move_type not in self.types[actor]:
             return 1.0
-        return 2.0 if self.b[actor].ability == ADAPTABILITY and actor != BOSS else 1.5
+        return 2.0 if adapt and actor != BOSS else 1.5         # a Terastallized boss's old types: no Adaptability
 
     def tera_move(self, actor, move):
         """The boss is Terastallized: its moves of its Tera type (0x8b's eighth argument)."""
@@ -275,6 +278,9 @@ class Battle:
             power *= 2
         elif name == "Rising Voltage" and self.terrain == "Electric" and self.grounded(target):
             power *= 2
+        elif name in ("Reversal", "Flail"):                 # by 48ths of HP left
+            ratio = max(self.hp[actor] * 48 // self.full[actor], 1)
+            power = 200 if ratio < 2 else 150 if ratio < 5 else 100 if ratio < 10 else 80 if ratio < 17 else 40 if ratio < 33 else 20
         mine = self.status.get(actor, (0,))[0]
         factor = {"Facade": 2 if mine and mine != SLP else 0, "Venoshock": 2 if st == PSN else 0,
                   "Electro Drift": 5461 / 4096 if self.effectiveness(move["type"], target) > 1 else 0,
@@ -391,7 +397,7 @@ def pp(battle, command, actor, number):
 
 
 def plain(move):
-    if move is None or move["category"] == "Status" or not move.get("basePower"):
+    if move is None or move["category"] == "Status" or not move.get("basePower") and move["name"] not in ("Reversal", "Flail"):
         raise Unsupported(f"not a damaging move: {move and move['name']}")
     if move.get("isNonstandard") in ("Past", "LGPE", "Gmax", "Future"):
         raise Unsupported(f"{move['name']} is not a Scarlet / Violet move")   # its game data differs
@@ -1556,6 +1562,13 @@ WHEN = {
     101: lambda battle, b, out, inc, every: any(m["basePower"] <= 60 for m in out),
     143: lambda battle, b, out, inc, every: any("contact" in m["flags"] for m in out),
     177: _using("Flying"),
+    142: lambda battle, b, out, inc, every: any("powder" in m["flags"] for m in inc),          # Overcoat
+    43: lambda battle, b, out, inc, every: any("sound" in m["flags"] for m in every),         # Soundproof
+    198: lambda battle, b, out, inc, every: bool(battle.fresh),                               # Stakeout
+    57: lambda battle, b, out, inc, every: any(x.ability in (57, 58) for i, x in battle.b.items()
+                                                if i != b.id and i != BOSS and b.id != BOSS),   # Plus, Minus: an ally's
+    58: lambda battle, b, out, inc, every: any(x.ability in (57, 58) for i, x in battle.b.items()
+                                                if i != b.id and i != BOSS and b.id != BOSS),
     109: None, 132: None, 140: None,                                # Unaware, Friend Guard, Telepathy: callbacks()
 }
 
@@ -1600,8 +1613,8 @@ def callbacks(b, battle=None, acts=()):
         live.discard("onModifyPriority")
     if b.ability in PINCH or b.ability in (HUGE_POWER, PURE_POWER):
         live -= {"onModifyAtk", "onModifySpA"}             # Battle.damage applies them
-    if b.ability == ADAPTABILITY and b.id != BOSS:
-        live.discard("onModifySTAB")
+    if b.ability == ADAPTABILITY:
+        live.discard("onModifySTAB")                    # Battle.stab applies it
     if b.ability == RIVALRY:
         live.discard("onBasePower")                     # Battle.damage applies it
     if b.ability in (HUSTLE, COMPOUND_EYES):
