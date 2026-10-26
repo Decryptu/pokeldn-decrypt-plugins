@@ -640,12 +640,18 @@ def before_move(battle, e):
         return message(actor, 122, actor) + queue.encode(0x52, (actor, 0)), False, "flinch"
     if actor in battle.confused:
         raise Unsupported("a confused battler moving")
-    if st and st[0] == FRZ:
-        if r.chance(20):
-            raise Unsupported("a thaw")
-        return stopped(battle, actor, e.move, 98, 45), False, "status"
-    if st and st[0] == SLP:
-        raise Unsupported("a sleeping battler moving")
+    if st and st[0] in (FRZ, SLP):
+        if st[0] == FRZ:
+            woke, text = r.chance(20), 99                   # thawed
+        else:
+            st[4] -= 1
+            woke, text = st[4] <= 0, 105                    # woke up
+        if not woke:
+            return stopped(battle, actor, e.move, 98 if st[0] == FRZ else 104, 45 if st[0] == FRZ else 42), False, "status"
+        del battle.status[actor]
+        q = queue.encode(0x14, (actor,)) + queue.encode(0x90, (actor, 0)) + message(actor, text, actor)
+        pre, goes, why = before_move(battle, e)
+        return q + pre, goes, why
     if st and st[0] == PAR and r.chance(25):
         return stopped(battle, actor, e.move, 93, 46), False, "status"
     return b"", True, None
@@ -883,8 +889,7 @@ def run(battle, e, entries):
         return raid_action(battle, e, entries)
     if e.kind == Entry.RESET:
         return reset(battle, e.value)
-    target = raid_target(battle, e.move)
-    used = handler(battle, (e.actor, e.move), 0x72000, last=False) + use(battle, e.actor, e.move, target)
+    used = handler(battle, (e.actor, e.move), 0x72000, last=False) + use(battle, e.actor, e.move, e.position)
     end = queue.encode(0x1E, (e.actor, 0))
     return q + queue.encode(0xC1, (9, 0)) + used[:-len(end)] + queue.encode(0xC1, (9, 1)) + end
 
@@ -912,7 +917,7 @@ def raid_action(battle, e, entries):
         if action in (raid.RESET_BOSS, raid.RESET_PLAYERS):
             entries.append(Entry(BOSS, Entry.RESET, value=action))
         elif action == raid.MOVE:
-            entries.append(Entry(BOSS, Entry.RAID_MOVE, move=move))
+            entries.append(Entry(BOSS, Entry.RAID_MOVE, move=move, position=raid_target(battle, move)))
         else:
             raise Unsupported(f"raid action {action}")
         return q
@@ -952,14 +957,20 @@ def reset(battle, action):
 
 
 def raid_target(battle, number):
-    """The position an extra action's move aims at: none (10) for a field move, the boss (4) for its own."""
+    """The position an extra action's move aims at: none (10) for a field move, the boss (4) for its own,
+    else a standing player drawn by below(n) over them in position order."""
     move = MOVES.get(number) or {}
     target = move.get("target")
     if target in ("all", "allySide", "foeSide", "allies"):
         return 10
     if target in ("self", "adjacentAllyOrSelf"):
         return POSITION[BOSS]
-    raise Unsupported(f"an extra action's move aimed at a player ({target})")
+    if target not in ("normal", "any", "randomNormal"):
+        raise Unsupported(f"an extra action's move aimed at {target}")
+    standing = [b for b in sorted(POSITION, key=POSITION.get) if b != BOSS and battle.hp[b]]
+    if not standing:
+        raise Unsupported("an extra action's move with no player standing")
+    return POSITION[standing[battle.rng.below(len(standing))]]
 
 
 def round_end(battle, entries, acted, won, counted):
@@ -1089,7 +1100,7 @@ def turn_end(battle, order):
         if b.item == LEFTOVERS and battle.hp[b.id] < battle.full[b.id]:
             raise Unsupported("Leftovers at the turn's end")
         live = callbacks(b) & {"onResidual"}
-        if battle.hp[b.id] and battle.status.get(b.id) and battle.status[b.id][0] not in (BRN, PSN, PAR, FRZ):
+        if battle.hp[b.id] and battle.status.get(b.id) and battle.status[b.id][0] not in (BRN, PSN, PAR, FRZ, SLP):
             raise Unsupported(f"battler {b.id}'s status at the turn's end")
         if b.ability == MOODY and battle.hp[b.id]:
             raise Unsupported("Moody at the turn's end")
