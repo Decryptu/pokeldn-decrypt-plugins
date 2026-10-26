@@ -45,7 +45,7 @@ class Raid:
                     push(SHIELD_END, 1)
         elif not self.late:
             if timed and self.shield_time and by_time(self.shield_time):
-                push(SHIELD, self.limit - left)
+                push(SHIELD, self.limit + battle.timer_offset - left)     # the seconds run
             elif not timed and self.shield_hp and battle.hp[BOSS] and self.share(battle) <= self.shield_hp:
                 push(SHIELD, 0)
         if timed and not self.late and by_time(10):

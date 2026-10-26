@@ -293,19 +293,22 @@ def use(battle, actor, number, position):
     q += queue.encode(0x7B, (number, battle.rounds, actor))
     for size in (20, 5, 5, 5, 19):
         q += queue.encode_group(0xCF, bytes(size))
-    total, done = 0, 0
+    total, parts = 0, []
     for i in range(hits):
-        q += queue.encode_group(0xCF, bytes(20))
         part, dmg, knockout, faint = strike(battle, actor, target, number, move, code, i, hits)
-        q += part
+        parts.append(part)
         total += dmg
-        done += 1
         if knockout or faint:
             break
+    done = len(parts)
+    for head, record, tail in parts:                        # each record carries the hits that landed
+        q += queue.encode_group(0xCF, bytes(20)) + head
+        q += queue.encode(0x8B, record[:9] + (done if hits > 1 else 0,)) + tail
     if hits > 1:
         if code != 7:
             q += queue.encode(0xCA, (actor, 574 if code > 7 else 575, END) + (0,) * 7)
-        q += queue.encode(0xCA, (actor, 516, done, END) + (0,) * 6)
+        if move["name"] != "Dragon Darts":                  # Dragon Darts shows no hit count
+            q += queue.encode(0xCA, (actor, 516, done, END) + (0,) * 6)
         if code > 7:
             q += queue.encode(0x20, (actor, 24)) * done
         q += queue.encode(0xA6, (96,))
@@ -323,9 +326,9 @@ def use(battle, actor, number, position):
 
 
 def strike(battle, actor, target, number, move, code, i, hits):
-    """-> (the queue of hit i of `hits`, its damage, whether it knocked the boss out, a player out): the
-    hit's flags (0x7e), record (0x8b, the hit index and the hits for a multi-hit move), damage, messages, record
-    (0x42), its effects and 0xd1."""
+    """-> ((the queue of hit i of `hits` before its 0x8b, the 0x8b's arguments, the queue after it), its
+    damage, whether it knocked the boss out, a player out): the hit's flags (0x7e), record (0x8b, the hit
+    index; the caller writes the hits that landed), damage, messages, record (0x42), its effects and 0xd1."""
     r = battle.rng
     multi = hits > 1
     if multi and (secondaries(move) or "drain" in move or battle.b[target].ability in CONTACT_STATUS
@@ -357,8 +360,8 @@ def strike(battle, actor, target, number, move, code, i, hits):
             continue                                        # the boss, or Inner Focus, cannot flinch: no draw
         if faint and set(sec) == {"chance", "boosts"}:
             continue                                        # a stat drop on a fainted player: no draw
-        if faint and "status" in sec:
-            raise Unsupported("a status secondary on a fainted player")
+        if faint and "status" in sec and sec["status"] == "slp":
+            raise Unsupported("a sleep secondary on a fainted player")
         turns = 0
         if sec.get("volatileStatus") == "confusion":
             turns = 2 + r.duration(4)                       # the duration, drawn before the chance
@@ -390,11 +393,11 @@ def strike(battle, actor, target, number, move, code, i, hits):
     e5[tpos] = code
     hit = [0] * 5
     hit[tpos] = 1
-    q = queue.encode(0x7E, (0, *hit))
-    q += queue.encode(0x7E, (1, *[int(crit) * h for h in hit]))
-    q += queue.encode(0x7E, (2, *e5))
-    q += queue.encode(0x8B, (apos, tpos, number, mtype, 0, i, 1, int(battle.tera_move(actor, move)),
-                             TARGET_CLASS.get(move["target"], 0), hits if multi else 0))
+    head = queue.encode(0x7E, (0, *hit))
+    head += queue.encode(0x7E, (1, *[int(crit) * h for h in hit]))
+    head += queue.encode(0x7E, (2, *e5))
+    record = (apos, tpos, number, mtype, 0, i, 1, int(battle.tera_move(actor, move)), TARGET_CLASS.get(move["target"], 0), 0)
+    q = b""
     if crit:
         q += queue.encode(0x37, (actor, 0, 1))
     q += queue.encode(0x37, (target, 2, dmg)) + queue.encode(0x37, (target, 5, 1))
@@ -437,14 +440,14 @@ def strike(battle, actor, target, number, move, code, i, hits):
             q += queue.encode(0xA7, (POSITION[actor], 51)) + queue.encode(0x03, (actor, heal))
             q += queue.encode(0x9A, (actor, heal)) + message(actor, 290, target)
     if knockout:
-        q += boss_down(battle, actor, number)
+        q += boss_down(battle, actor, number, quiet=multi)
     elif faint:
-        q += player_down(battle, target, actor, number)
+        q += player_down(battle, target, actor, number, quiet=multi)
     q += queue.encode(0xD1, bytes([1, 0]))
     if move["type"] == "Fire" and battle.hp[target] and battle.status.get(target, (0,))[0] == FRZ:
         del battle.status[target]                           # a Fire hit thaws its target
         q += queue.encode(0x14, (target,)) + queue.encode(0x90, (target, 0)) + message(target, 99, target)
-    return q, dmg, knockout, faint
+    return (head, record, q), dmg, knockout, faint
 
 
 def sand_spit(battle, b):
@@ -688,6 +691,20 @@ def stopped(battle, actor, number, text, code=None, handler_pair=True):
     return q
 
 
+def no_pp(battle, e):
+    """Whether a player's move has no PP left (it fails with message 578); else its PP are spent: 2 against
+    a target with Pressure."""
+    b = battle.b[e.actor]
+    if e.move not in b.moves:
+        return False
+    i = b.moves.index(e.move)
+    if not b.pp[i]:
+        return True
+    target = BATTLER_AT.get(e.position)
+    b.pp[i] = max(0, b.pp[i] - (2 if target and battle.b[target].ability == PRESSURE else 1))
+    return False
+
+
 def before_move(battle, e):
     """-> (the queue of what stops or precedes a move, whether the move goes on): a flinch, freeze (thawing
     on chance(20)), sleep, full paralysis (chance(25))."""
@@ -715,11 +732,11 @@ def before_move(battle, e):
     return b"", True, None
 
 
-def boss_down(battle, actor, number):
+def boss_down(battle, actor, number, quiet=False):
     """The boss knocked out, after the hit's record: the battle is won. 0x09 carries the knocking move's
     slot in its user's moveset (382 of 383 oracle knockouts)."""
     q = queue.encode(0x49, (BOSS, actor, number)) + queue.encode(0x09, (actor, battle.slot(actor, number) or 0))
-    q += queue.encode(0x37, (BOSS, 1, 1)) + message(BOSS, 0, BOSS) + queue.encode(0x94, (BOSS, 0))
+    q += queue.encode(0x37, (BOSS, 1, 1)) + (b"" if quiet else message(BOSS, 0, BOSS)) + queue.encode(0x94, (BOSS, 0))
     q += queue.encode(0x37, (BOSS, 8, 1))
     q += b"".join(queue.encode(c, (BOSS,)) for c in (0x5F, 0x62, 0x6C, 0x5D))
     q += b"".join(queue.encode(0x41, (b, BOSS)) for b in sorted(battle.b) if b != BOSS and battle.hp[b])
@@ -730,18 +747,21 @@ def boss_down(battle, actor, number):
 PENALIZED = frozenset((1, 3))       # the host's and the console's Pokemon: a faint costs battle time
 
 
-def player_down(battle, victim, actor, number):
-    """A player's Pokemon knocked out, after the hit's record: as the boss's knockout with the victim's id,
-    0x41 (b, V) for each battler still standing, no 0x80, and for the host's or the console's Pokemon
+def player_down(battle, victim, actor, number, quiet=False):
+    """A player's Pokemon knocked out, after the hit's record: as the boss's knockout with the victim's id
+    (inside a multi-hit move without the fainted message), 0x41 (b, V) for each battler still standing, no
+    0x80, and for the host's or the console's Pokemon
     0x81 (-n), n seconds off the battle timer: the time limit times 0.125 times the players' mean level over
     the boss's (339 of 339 oracle battles; float32, truncated)."""
     battle.hp[victim] = 0
     battle.faints[victim] += 1
+    battle.status.pop(victim, None)                         # a faint clears its status
+    battle.confused.pop(victim, None)
     for e in battle.entries:
         if e.actor == victim:
             e.done = True                                   # its actions are marked run
     q = queue.encode(0x49, (victim, actor, number)) + queue.encode(0x09, (actor, battle.slot(actor, number) or 0))
-    q += queue.encode(0x37, (victim, 1, 1)) + message(victim, 0, victim) + queue.encode(0x94, (victim, 0))
+    q += queue.encode(0x37, (victim, 1, 1)) + (b"" if quiet else message(victim, 0, victim)) + queue.encode(0x94, (victim, 0))
     q += queue.encode(0x37, (victim, 8, 1))
     q += b"".join(queue.encode(c, (victim,)) for c in (0x5F, 0x62, 0x6C, 0x5D))
     q += b"".join(queue.encode(0x41, (b, victim)) for b in sorted(battle.b) if battle.hp[b])
@@ -936,6 +956,10 @@ def run(battle, e, entries):
     if e.kind == Entry.MOVE:
         q += handler(battle, (e.actor, e.move), 0x72000, last=False)
         pre, goes, why = before_move(battle, e)
+        if goes and e.actor != BOSS and no_pp(battle, e):
+            q += pre + queue.encode(0xC9, (e.actor, 0, e.move, 10, 1))
+            q += queue.encode(0xCA, (e.actor, 578, e.actor, END) + (0,) * 6) + queue.encode(0x52, (e.actor, 0))
+            return q + queue.encode(0x5B, (e.actor, e.move)) * 2 + queue.encode(0x1E, (e.actor, 0))
         if not goes:
             move = MOVES.get(e.move) or {"type": "Normal"}
             tail = queue.encode(0x5B, (e.actor, e.move)) * 2 + queue.encode(0x1E, (e.actor, 0))
@@ -1031,6 +1055,11 @@ def raid_target(battle, number):
     return POSITION[standing[battle.rng.below(len(standing))]]
 
 
+def standing(battle):
+    """The battlers still standing, in id order: what the round end's speed sorts take (0x1144704)."""
+    return [b for b in sorted(battle.b) if battle.hp[b]]
+
+
 def round_end(battle, entries, acted, won, counted):
     """The round's end: three battler sorts (eight at a turn's end), 0xb2, 0x37 per action, the turn
     counter 0x75 when a player acted, the turn's end every fourth such round, 0xc5, 0x43 in the second
@@ -1039,7 +1068,7 @@ def round_end(battle, entries, acted, won, counted):
     # a round ends with three battler sorts, the second the 0x43 order; a turn's end with eight, the
     # fourth or fifth its residual order (no tie told them apart), the seventh, after the turn's end, the
     # 0x43 order (a Speed Boost there already counts)
-    ends = [speed_order(battle, sorted(battle.b), battle.speed) for _ in range(3 if won or n != 0 else 5)]
+    ends = [speed_order(battle, standing(battle), battle.speed) for _ in range(3 if won or n != 0 else 5)]
     if won and len({battle.speed(b) for b in battle.b}) != len(battle.b):
         raise Unsupported("a speed tie in the winning round")
     q = b""
@@ -1052,7 +1081,7 @@ def round_end(battle, entries, acted, won, counted):
             if ends[3] != ends[4] or "sand" in battle.field and len({tuple(e) for e in ends[1:6]}) > 1:
                 raise Unsupported("a speed tie at a turn's end")
             q += turn_end(battle, ends[3])
-            ends += [speed_order(battle, sorted(battle.b), battle.speed) for _ in range(3)]
+            ends += [speed_order(battle, standing(battle), battle.speed) for _ in range(3)]
         q += queue.encode(0xC5, (1,))
     q += b"".join(queue.encode(0x43, (b,)) for b in ends[1 if won or n != 0 else 6] if battle.hp[b])
     acted = battle.listed + [b for b in acted if b not in battle.listed]
@@ -1269,7 +1298,7 @@ _probe = _data("handler_moves.json")
 HANDLER_MOVES, UNSEEN_MOVES = frozenset(_probe["handler"]), frozenset(_probe["unseen"])
 
 
-REVIVE_ABILITIES = frozenset((46,))     # Pressure: announced again; other switch-in abilities are refused
+REVIVE_ABILITIES = frozenset((46, 104, 163, 164, 213, 119, 107, 127))   # announced again as at the start
 
 
 def revive(battle, slot):
@@ -1282,7 +1311,7 @@ def revive(battle, slot):
     x = battle.b[b]
     if battle.hp[b]:
         raise Unsupported(f"battler {b} revived standing")
-    if x.ability not in REVIVE_ABILITIES and x.ability not in start.QUIET_ABILITIES | start.QUIET_TOO:
+    if x.ability not in REVIVE_ABILITIES | start.QUIET_ABILITIES | start.QUIET_TOO | {start.OWN_TEMPO, start.INNER_FOCUS}:
         raise Unsupported(f"battler {b}'s ability {x.ability} on its revive")
     if x.item not in start.QUIET_ITEMS:
         raise Unsupported(f"battler {b}'s item {x.item} on its revive")
@@ -1295,7 +1324,9 @@ def revive(battle, slot):
     q += queue.encode(0x3D, (pos,)) + queue.encode(0x16, (pos, 0, 0, battle.rounds))
     q += queue.encode(0x5E, (b, x.ability)) + queue.encode(0x61, (b,)) + queue.encode(0x6B, (b,)) + queue.encode(0x4E, (b,))
     q += queue.encode(0x98, (pos, 0, 0, 1)) + queue.encode(0x20, (b, 18))
-    if x.ability in REVIVE_ABILITIES:
+    if x.ability == start.UNNERVE:
+        q += start.unnerve(x)
+    elif x.ability in REVIVE_ABILITIES:
         q += start.ability_in(x, battle.b, battle.stages, battle)
     block = bytearray(0x238)
     struct.pack_into("<Q", block, slot * BLOCK, 8)
