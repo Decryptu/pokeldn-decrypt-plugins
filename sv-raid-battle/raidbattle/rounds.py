@@ -784,8 +784,7 @@ def sand_spit(battle, b):
     the start weather's commands and no message."""
     if "sand" in battle.field:
         return b""                                          # Showdown setWeather: the same weather from an ability fails
-    if battle.field & {"sun", "rain", "snow"}:
-        raise Unsupported("Sand Spit with a weather up")
+    battle.field -= {"sun", "rain", "snow"}                 # replaced, as by a weather move
     if any(WEATHER_ABILITIES.get(x.ability, set()) & {"sand"} for x in battle.b.values() if x.ability not in WEATHER_HANDLED):
         raise Unsupported("an ability reads the weather")
     battle.field.add("sand")
@@ -965,8 +964,9 @@ def side_end(battle):
 
 def weather_start(battle, name, w, b):
     """A weather raised by battler b: 0x6a (0), 0x69 (0, w), 0x79 (w, 5, 0, b, 0), 0x88 (w, b, 0)."""
-    if battle.field & {"sun", "rain", "snow", "sand"}:
-        raise Unsupported("a weather over another")
+    if name in battle.field:
+        raise Unsupported("a weather over itself")
+    battle.field -= {"sun", "rain", "snow", "sand"}         # another weather is replaced, with no end shown
     if any(WEATHER_ABILITIES.get(x.ability, set()) & {name} for x in battle.b.values() if x.ability not in WEATHER_HANDLED):
         raise Unsupported("an ability reads the weather")
     if battle.b[b].item in (SMOOTH_ROCK, 284, 285, 259):         # Smooth Rock, Heat Rock, Damp Rock, Icy Rock
