@@ -145,6 +145,7 @@ class Battle:
         self.fresh = set()                              # battlers revived since the last turn end
         self.charged = set()
         self.spent = {}
+        self.focused = set()                            # battlers under Focus Energy
         self.spreading = False                          # a spread move's hits are being computed
         self.orb = collections.Counter()                # battler -> moves begun since its orb was last drained                                 # battler -> PP its current move spent (0x05)                            # battlers Wind Power charged (their next Electric move)
         self.sides = {0: {}, 1: {}}                     # side (0 players, 1 boss) -> {condition: [turns left, setter]}
@@ -477,7 +478,7 @@ def spread(battle, actor, number, move):
     battle.spreading = True
     try:
         for t in targets:
-            crit = battle.b[t].ability not in CRIT_GUARD and r.below(CRIT_DRAW[move.get("critRatio", 1)]) == 0
+            crit = battle.b[t].ability not in CRIT_GUARD and r.below(crit_draw(battle, actor, move)) == 0
             roll = r.below(16)
             dmg = battle.damage(actor, t, move, roll, crit)
             if dmg >= battle.hp[t]:
@@ -561,6 +562,14 @@ def accuracy(battle, actor, move, target):
     return min(acc, 100)
 
 
+def crit_draw(battle, actor, move):
+    """The critical hit's below(n): by the move's stage, raised 2 by Focus Energy (condition 9)."""
+    stage = move.get("critRatio", 1) + 2 * (actor in battle.focused)
+    if stage not in CRIT_DRAW:
+        raise Unsupported("a critical-hit stage of 4 or more")
+    return CRIT_DRAW[stage]
+
+
 def strike(battle, actor, target, number, move, code, i, hits):
     """-> ((the queue of hit i of `hits` before its 0x8b, the 0x8b's arguments, the queue after it), its
     damage, whether it knocked the boss out, a player out): the hit's flags (0x7e), record (0x8b, the hit
@@ -572,7 +581,7 @@ def strike(battle, actor, target, number, move, code, i, hits):
                   or battle.b[target].item == AIR_BALLOON or battle.b[target].ability in (RATTLED, SAND_SPIT)):
         raise Unsupported("a multi-hit move with an effect")
     # Battle Armor and Shell Armor (Showdown onCriticalHit false): no critical-hit draw
-    crit = battle.b[target].ability not in CRIT_GUARD and r.below(CRIT_DRAW[move.get("critRatio", 1)]) == 0
+    crit = battle.b[target].ability not in CRIT_GUARD and r.below(crit_draw(battle, actor, move)) == 0
     roll = r.below(16)
     dmg = battle.damage(actor, target, move, roll, crit)
     if target == BOSS:
@@ -773,7 +782,7 @@ def status_move(battle, move):
         return move
     if move["name"].split()[0] in TERRAINS and move["callbacks"] == ["condition", "terrain"]:
         return move
-    if move["name"] == "Tailwind":
+    if move["name"] in ("Tailwind", "Focus Energy"):
         return move
     if move.get("status") in STATUS and not any(k in move for k in ("self", "volatileStatus", "boosts",
                                                                       "secondary", "secondaries")):
@@ -977,6 +986,27 @@ def spread_status(battle, actor, number, move):
     return q + queue.encode(0x5B, (actor, number)) * 2 + queue.encode(0x1E, (actor, 0))
 
 
+def focus_energy(battle, actor, number, position, move):
+    """Focus Energy: a status move on its user whose effect is condition 9, 0x1e (A, 9), 0x7d (9, A, 0, 0)
+    and message 336, its critical hits two stages up from then on."""
+    if actor in battle.focused:
+        raise Unsupported("Focus Energy again")
+    battle.focused.add(actor)
+    mtype = TYPES.index(move["type"])
+    q = b""
+    if actor != BOSS:
+        q += queue.encode(0x05, (actor, battle.slot(actor, number), battle.spent.get(actor, 1)))
+    q += pp(battle, 0x07, actor, number) + queue.encode(0xC9, (actor, 0, number, position, 0))
+    battle.orb[actor] += actor != BOSS
+    q += queue.encode(0x7B, (number, battle.rounds, actor)) + queue.encode_group(0xCF, bytes(20))
+    q += queue.encode(0x7E, (0, 0, 0, 0, 0, 0)) + queue.encode(0x7E, (1, 0, 0, 0, 0, 0)) + queue.encode(0x7E, (2, 7, 7, 7, 7, 7))
+    q += queue.encode(0x8B, (POSITION[actor], POSITION[actor], number, mtype, 0, 0, 0, 0, 7, 0))
+    q += queue.encode(0x1E, (actor, 9)) + queue.encode(0x7D, (9, actor, 0, 0)) + message(0, 336, actor)
+    q += queue.encode(0x7C, ()) + pp(battle, 0x08, actor, number)
+    q += queue.encode(0x1D, (actor, position, mtype, 1, 0, number, number))
+    return q + queue.encode(0x5B, (actor, number)) * 2 + queue.encode(0x1E, (actor, 0))
+
+
 def status_use(battle, actor, number, position):
     """-> the queue for a stat-stage status move: one zero group, no hit, the hit record with the
     move's target class, the stat changes."""
@@ -987,6 +1017,8 @@ def status_use(battle, actor, number, position):
         return weather_use(battle, actor, number, position, move)
     if position == 10 and move["target"] == "allAdjacentFoes":
         return spread_status(battle, actor, number, move)
+    if move["name"] == "Focus Energy":
+        return focus_energy(battle, actor, number, position, move)
     own = move["target"] == "self"
     target = actor if own else BATTLER_AT[position]
     if not own and (actor == BOSS) == (target == BOSS):
@@ -1248,6 +1280,7 @@ def player_down(battle, victim, actor, number, quiet=False):
     battle.status.pop(victim, None)                         # a faint clears its status
     battle.confused.pop(victim, None)
     battle.charged.discard(victim)
+    battle.focused.discard(victim)
     for e in battle.entries:
         if e.actor == victim:
             e.done = True                                   # its actions are marked run
@@ -1587,9 +1620,9 @@ def reset(battle, action):
     players' stat changes (0x10 each) and abilities (condition 16 by 0x13 (b, 16, 0, b << 26 | 12, 2) for each
     whose ability can be suppressed), then 0xc2 (60, 2, 0)."""
     if action == raid.RESET_BOSS:
-        if any(n > 0 for n in battle.stages[BOSS]):
-            raise Unsupported("the boss's raised stats reset")
-        battle.stages[BOSS] = [0] * 8
+        if BOSS in battle.focused or BOSS in battle.confused:
+            raise Unsupported("the boss's Focus Energy or confusion at its reset")
+        battle.stages[BOSS] = [max(0, n) for n in battle.stages[BOSS]]      # its lowered stats only
         q = queue.encode(0x0F, (BOSS,))
         if battle.status.pop(BOSS, None):
             q += queue.encode(0x14, (BOSS,)) + queue.encode(0x90, (BOSS, 0))   # its status cured too
@@ -1598,6 +1631,8 @@ def reset(battle, action):
     suppressed = [b for b in standing if battle.b[b].ability not in CANT_SUPPRESS]
     if any(battle.b[b].suppressed for b in suppressed):
         raise Unsupported("an ability suppressed twice")
+    if any(n < 0 for b in standing for n in battle.stages[b]):
+        raise Unsupported("a player's lowered stat at the players' reset")
     for b in standing:
         battle.stages[b] = [0] * 8
     for b in suppressed:
