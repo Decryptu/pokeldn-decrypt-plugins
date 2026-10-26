@@ -349,7 +349,7 @@ def plain(move):
         raise Unsupported("crit stage")
     for sec in secondaries(move):
         if set(sec) - {"chance", "status", "volatileStatus", "boosts"} or "chance" not in sec or len(sec) == 1:
-            raise Unsupported("secondary")
+            raise Unsupported(f"secondary of {move['name']}: {sorted(sec)}")
     return move
 
 
@@ -565,7 +565,8 @@ def strike(battle, actor, target, number, move, code, i, hits):
         q += queue.encode(0xA7, (tpos, 131)) + queue.encode(0x20, (actor, 26))
     q += queue.encode(0x42, (target, actor, apos, mtype, cat, number, dmg))
     if battle.b[target].ability == SAND_SPIT:
-        if knockout or drops or battle.b[target].item in (AIR_BALLOON, SMOOTH_ROCK) or battle.b[target].ability == RATTLED:
+        if (knockout or drops or battle.b[target].item in (AIR_BALLOON, SMOOTH_ROCK) or battle.b[target].ability == RATTLED) \
+                and "sand" not in battle.field:
             raise Unsupported("Sand Spit beside another effect")
         q += sand_spit(battle, target)
     if battle.b[target].item == AIR_BALLOON and not (target == BOSS and knockout):
@@ -602,7 +603,9 @@ def strike(battle, actor, target, number, move, code, i, hits):
 def sand_spit(battle, b):
     """Sand Spit (Showdown abilities.ts): hit by a damaging move, it starts a sandstorm for 5 turns, with
     the start weather's commands and no message."""
-    if battle.field & {"sun", "rain", "snow", "sand"}:
+    if "sand" in battle.field:
+        return b""                                          # Showdown setWeather: the same weather from an ability fails
+    if battle.field & {"sun", "rain", "snow"}:
         raise Unsupported("Sand Spit with a weather up")
     if any(WEATHER_ABILITIES.get(x.ability, set()) & {"sand"} for x in battle.b.values() if x.ability not in WEATHER_HANDLED):
         raise Unsupported("an ability reads the weather")
