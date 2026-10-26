@@ -38,7 +38,21 @@ IDLE_MOVE_CALLBACKS = {"Facade": {"onBasePower"}, "Venoshock": {"onBasePower"}, 
                        "Collision Course": {"onBasePower"}, "Expanding Force": {"onBasePower"},
                        "Payback": {"basePowerCallback"}, "Hex": {"basePowerCallback"},
                        "Rising Voltage": {"basePowerCallback"}, "Sunsteel Strike": {"ignoreAbility"},
-                       "Moongeist Beam": {"ignoreAbility"}, "Salt Cure": {"condition"}}
+                       "Moongeist Beam": {"ignoreAbility"}, "Salt Cure": {"condition"},
+                       "False Swipe": {"onDamage", "onDamagePriority"}, "Secret Sword": {"overrideDefensiveStat"},
+                       "Chip Away": {"ignoreDefensive", "ignoreEvasion"}, "Sacred Sword": {"ignoreDefensive", "ignoreEvasion"},
+                       "Darkest Lariat": {"ignoreDefensive", "ignoreEvasion"}}
+# moves whose own callback does nothing in the round at hand (Showdown moves.ts): use() refuses the others
+IDLE_WHEN = {
+    "Thunder": lambda b, a, t: not b.field & {"sun", "rain"}, "Hurricane": lambda b, a, t: not b.field & {"sun", "rain"},
+    "Bleakwind Storm": lambda b, a, t: "rain" not in b.field, "Wildbolt Storm": lambda b, a, t: "rain" not in b.field,
+    "Sandsear Storm": lambda b, a, t: "rain" not in b.field, "Blizzard": lambda b, a, t: "snow" not in b.field,
+    "Weather Ball": lambda b, a, t: not b.field & {"sun", "rain", "snow", "sand"},
+    "Brick Break": lambda b, a, t: not {REFLECT, LIGHT_SCREEN} & set(b.sides[int(t == BOSS)]),
+    "Psychic Fangs": lambda b, a, t: not {REFLECT, LIGHT_SCREEN} & set(b.sides[int(t == BOSS)]),
+    "Knock Off": lambda b, a, t: not b.b[t].item, "Grassy Glide": lambda b, a, t: b.terrain != "Grassy",
+    "Scorching Sands": lambda b, a, t: b.status.get(t, (0,))[0] != FRZ, "Fell Stinger": lambda b, a, t: True,
+}
 PRESSURE = 46               # a move aimed at it spends 2 PP: 0x05 (b, 0, 2)
 STURDY = 5
 INNER_FOCUS = 39
@@ -148,7 +162,7 @@ class Battle:
         self.field = set()                              # "sun", "rain", "snow", "sand"
         self.terrain = None                             # "Grassy", "Misty", "Electric", "Psychic"
         self.terrain_left = 0                           # turn ends until the terrain ends
-        self.fresh = set()                              # battlers revived since the last turn end
+        self.fresh = set()                              # battlers revived that have not acted since
         self.charged = set()
         self.spent = {}
         self.focused = set()
@@ -241,13 +255,13 @@ class Battle:
 
     def move_power(self, actor, target, move):
         """-> (base power, its onBasePower factor or 0) for a move whose power has its own rule (Showdown
-        moves.ts): Payback doubled when the target moves no more this round, Hex on a statused target,
+        moves.ts): Payback doubled when the target has moved this round, Hex on a statused target,
         Rising Voltage on a grounded target in Electric Terrain; Facade times 2 under a status other than
         sleep, Venoshock on a poisoned target, Electro Drift and Collision Course 5461/4096 when super
         effective, Expanding Force 1.5 in Psychic Terrain from a grounded user."""
         name, power = move["name"], move["basePower"]
         st = self.status.get(target, (0,))[0]
-        if name == "Payback" and not any(e.actor == target and not e.done for e in self.entries):
+        if name == "Payback" and target in self.moved:
             power *= 2
         elif name == "Hex" and st:
             power *= 2
@@ -264,12 +278,15 @@ class Battle:
         a, d = self.b[actor], self.b[target]
         physical = move["category"] == "Physical"
         # a critical hit ignores the user's lowered and the target's raised stages (Showdown getDamage)
-        ast, dst = self.stages[actor][1 if physical else 3], self.stages[target][2 if physical else 4]
+        hits_def = physical or move.get("overrideDefensiveStat") == "def" or move["name"] == "Secret Sword"
+        ast, dst = self.stages[actor][1 if physical else 3], self.stages[target][2 if hits_def else 4]
         if crit:
             ast, dst = max(ast, 0), min(dst, 0)
+        if "ignoreDefensive" in move["callbacks"]:
+            dst = 0                                         # Chip Away and kin: the target's stages ignored
         att = staged(a.stats[1] if physical else a.stats[4], ast)
-        dfn = staged(d.stats[2] if physical else d.stats[5], dst)
-        if not physical and "sand" in self.field and "Rock" in self.defending(target):
+        dfn = staged(d.stats[2] if hits_def else d.stats[5], dst)
+        if not hits_def and "sand" in self.field and "Rock" in self.defending(target):
             dfn = modify(dfn, 1.5)                          # Showdown conditions.ts: sandstorm's onModifySpD
         if a.ability in PINCH and move["type"] == PINCH[a.ability] and self.hp[actor] * 3 <= self.full[actor]:
             att = modify(att, 1.5)                          # Showdown: Overgrow, Blaze, Torrent, Swarm
@@ -371,7 +388,7 @@ def plain(move):
     for key in ("self", "volatileStatus", "status", "boosts"):
         if key in move:
             raise Unsupported(f"a move with {key}")
-    if set(move["callbacks"]) - IDLE_MOVE_CALLBACKS.get(move["name"], set()):
+    if set(move["callbacks"]) - IDLE_MOVE_CALLBACKS.get(move["name"], set()) and move["name"] not in IDLE_WHEN:
         raise Unsupported(f"{move['name']}'s {move['callbacks'][0]}")
     # "any": one target, any position; a spread move hits only the commanded position in a raid
     if move["target"] not in ("normal", "any", "allAdjacent", "allAdjacentFoes"):
@@ -398,6 +415,8 @@ def use(battle, actor, number, position):
     if position == 10:
         return spread(battle, actor, number, move)
     target = BATTLER_AT[position]
+    if move["name"] in IDLE_WHEN and not IDLE_WHEN[move["name"]](battle, actor, target):
+        raise Unsupported(f"{move['name']}'s {move['callbacks'][0]}")
     if "ignoreAbility" in move["callbacks"] and battle.b[target].ability in BREAKABLE:
         raise Unsupported("a move ignoring an ability that changes its hit")
     r = battle.rng
@@ -562,8 +581,9 @@ def accuracy(battle, actor, move, target):
     Sand Veil's or Snow Cloak's 3277/4096 in their weather on the target."""
     acc = move["accuracy"]
     a = battle.b[actor].ability
-    boost = max(-6, min(6, battle.stages[actor][6] - battle.stages[target][7]))
-    if boost and ({a, battle.b[target].ability} & {51, 109, 300} or move["name"] in ("Chip Away", "Sacred Sword", "Darkest Lariat")):
+    evasion = 0 if "ignoreEvasion" in move.get("callbacks", ()) else battle.stages[target][7]
+    boost = max(-6, min(6, battle.stages[actor][6] - evasion))
+    if boost and {a, battle.b[target].ability} & {51, 109, 300}:
         raise Unsupported("a stage beside Keen Eye, Unaware, Mind's Eye or a move ignoring evasion")
     if boost > 0:
         acc = acc * (3 + boost) // 3                        # Showdown hitStepAccuracy: the stages first
@@ -589,6 +609,19 @@ def crit_draw(battle, actor, move):
     return CRIT_DRAW[stage]
 
 
+AFTER_KNOCKOUT = frozenset({153, 264, 265, 224, 266, 267})   # Moxie, Chilling and Grim Neigh, Beast Boost, As One
+
+
+def after_knockout(battle, actor):
+    """Moxie (153) after its holder knocks a player out, after the hit's 0xd1: 0x25 (A), 0xc7 (A, 153), +1
+    Attack (0x0c, 0x92, message 11) and 0xc8 (A); the others are refused."""
+    if battle.b[actor].ability != 153 or battle.stages[actor][1] >= 5:
+        raise Unsupported(f"ability {battle.b[actor].ability} after a knockout, or Moxie near +6")   # one showed nothing at +5
+    battle.stages[actor][1] += 1
+    q = queue.encode(0x25, (actor,)) + queue.encode(0xC7, (actor, 153)) + queue.encode(0x0C, (actor, 1, 1))
+    return q + queue.encode(0x92, (actor, 1, 1, 0)) + message(actor, 11, actor) + queue.encode(0xC8, (actor,))
+
+
 def strike(battle, actor, target, number, move, code, i, hits):
     """-> ((the queue of hit i of `hits` before its 0x8b, the 0x8b's arguments, the queue after it), its
     damage, whether it knocked the boss out, a player out): the hit's flags (0x7e), record (0x8b, the hit
@@ -609,10 +642,14 @@ def strike(battle, actor, target, number, move, code, i, hits):
                                                            battle.b[target].item == FOCUS_SASH):
         raise Unsupported("Sturdy or Focus Sash")
     dmg = min(dmg, battle.hp[target])
+    if move["name"] == "False Swipe" and dmg == battle.hp[target]:
+        raise Unsupported("False Swipe leaving 1 HP")      # its own message is unmeasured
     if battle.b[target].ability == SHIELDS_DOWN and 2 * (battle.hp[target] - dmg) <= battle.full[target]:
         raise Unsupported("Shields Down at half HP")
     knockout = target == BOSS and dmg == battle.hp[target]
     faint = target != BOSS and dmg == battle.hp[target]
+    if move["name"] == "Fell Stinger" and (knockout or faint):
+        raise Unsupported("Fell Stinger's knockout")
     rattled = battle.b[target].ability == RATTLED and move["type"] in ("Bug", "Dark", "Ghost")
     if faint and (rattled or battle.b[target].ability == SAND_SPIT and "sand" not in battle.field):
         raise Unsupported(f"a knockout beside an item or ability that answers the hit: {battle.b[target].item} {battle.b[target].ability}")
@@ -729,6 +766,8 @@ def strike(battle, actor, target, number, move, code, i, hits):
     elif faint:
         q += player_down(battle, target, actor, number, quiet=multi)
     q += queue.encode(0xD1, bytes([1, 0]))
+    if faint and battle.b[actor].ability in AFTER_KNOCKOUT:
+        q += after_knockout(battle, actor)
     if move["type"] == "Fire" and battle.hp[target] and battle.status.get(target, (0,))[0] == FRZ:
         del battle.status[target]                           # a Fire hit thaws its target
         q += queue.encode(0x14, (target,)) + queue.encode(0x90, (target, 0)) + message(target, 99, target)
@@ -1769,6 +1808,7 @@ def build(battle, slot, command):
     if any(b.transformed for b in battle.b.values()):
         raise Unsupported("a transformed battler")       # its copied stats, moves and types are not built
     weather_check(battle, acts)
+    battle.fresh -= {a[0] for a in acts}                    # acting counts as a turn in (Speed Boost's activeTurns)
     involved = {a[0] for a in acts} | {BATTLER_AT[a[2]] for a in acts if a[2] in BATTLER_AT}
     for b in battle.b.values():
         live = callbacks(b, battle, acts)
@@ -1885,7 +1925,7 @@ def turn_end(battle, order):
     q += side_end(battle)
     q += b"".join(queue.encode(0x44, (k,)) for k in range(1, 9)) + terrain_end(battle)
     q += b"".join(queue.encode(0x44, (k,)) for k in range(9, 14))
-    fresh, battle.fresh = battle.fresh, set()
+    fresh = battle.fresh
     for b in order:
         if battle.hp[b] and battle.b[b].ability == SPEED_BOOST and b not in fresh:      # Showdown: activeTurns
             if battle.stages[b][5] == 6:
