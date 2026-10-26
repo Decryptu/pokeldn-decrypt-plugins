@@ -82,6 +82,7 @@ STATUS_IMMUNE_TYPES = {PAR: {"Electric"}, BRN: {"Fire"}, FRZ: {"Ice"}, PSN: {"Po
 # Showdown abilities.ts: abilities that refuse a status (refused when one would land)
 STATUS_GUARDS = frozenset((7, 15, 17, 40, 41, 72, 102, 166, 175, 197, 199, 213, 257, 270, 272))
 GUTS = 62
+MARVEL_SCALE, QUICK_FEET, ANGER_POINT, STEADFAST, SYNCHRONIZE = 63, 95, 83, 80, 28
 HUSTLE, THICK_FAT, STRONG_JAW, RECKLESS, TINTED_LENS = 55, 47, 173, 120, 110
 SERENE_GRACE, SHIELD_DUST, COMPOUND_EYES, SKILL_LINK, STENCH = 32, 19, 14, 92, 1
 # abilities that act only through a held item (a berry, an item to steal or pass on)
@@ -174,6 +175,8 @@ class Battle:
         spe = staged(self.b[battler].speed, self.stages[battler][5])
         if raw:
             return spe                                      # a sort's handler key: no Tailwind, no paralysis
+        if self.b[battler].ability == QUICK_FEET and self.status.get(battler):
+            raise Unsupported("Quick Feet under a status")
         rush = SPEED_WEATHER.get(self.b[battler].ability) in self.field
         tail = TAILWIND in self.sides[int(battler == BOSS)]
         paralysed = self.status.get(battler, (0,))[0] == PAR
@@ -304,6 +307,11 @@ class Battle:
         x = int(x * e)
         if a.ability == TINTED_LENS and e < 1:
             x = modify(x, 2)                                # Showdown abilities.ts: Tinted Lens
+        if a.ability == GUTS and self.status.get(actor) and physical or \
+                d.ability == MARVEL_SCALE and self.status.get(target) and physical and a.ability not in MOLD_BREAKERS:
+            raise Unsupported("Guts or Marvel Scale under a status")
+        if crit and d.ability == ANGER_POINT and a.ability not in MOLD_BREAKERS:
+            raise Unsupported("a critical hit into Anger Point")
         if physical and self.status.get(actor, (0,))[0] == BRN:
             if a.ability == GUTS or move["name"] == "Facade":
                 raise Unsupported("Guts or Facade while burned")
@@ -943,6 +951,32 @@ def shielded(battle, actor, number, position, move):
     return q + queue.encode(0x5B, (actor, number)) * 2 + queue.encode(0x1E, (actor, 0))
 
 
+def spread_status(battle, actor, number, move):
+    """The boss's stat-dropping status move on every standing player (Leer, Growl): an accuracy draw per
+    target in position order, the hit record with class 5 at position 10, then each target's drop."""
+    if move.get("status") or not move.get("boosts") or any(v >= 0 for v in move["boosts"].values()):
+        raise Unsupported("a spread status move of this kind")
+    targets = [b for b in sorted(POSITION, key=POSITION.get) if b != BOSS and battle.hp[b]]
+    if battle.raid.state == 1 or not targets:
+        raise Unsupported("a spread status move with no target")
+    r = battle.rng
+    for t in targets:
+        if type(move["accuracy"]) is int and not r.chance(accuracy(battle, actor, move, t)):
+            raise Unsupported("a spread status move missing")
+        if all(battle.stages[t][STATS[k]] == -6 for k in move["boosts"]):
+            raise Unsupported("a spread status move on a stat at -6")
+    mtype = TYPES.index(move["type"])
+    q = pp(battle, 0x07, actor, number) + queue.encode(0xC9, (actor, 0, number, 10, 0))
+    q += queue.encode(0x7B, (number, battle.rounds, actor)) + queue.encode_group(0xCF, bytes(20))
+    q += queue.encode(0x7E, (0, 0, 0, 0, 0, 0)) + queue.encode(0x7E, (1, 0, 0, 0, 0, 0)) + queue.encode(0x7E, (2, 7, 7, 7, 7, 7))
+    q += queue.encode(0x8B, (POSITION[actor], 10, number, mtype, 0, 0, 0, 0, 5, 0))
+    for t in targets:
+        q += stat_drop(battle, actor, t, move["boosts"], secondary=False)
+    q += queue.encode(0x7C, ()) + pp(battle, 0x08, actor, number)
+    q += queue.encode(0x1D, (actor, 10, mtype, 1, 0, number, number))
+    return q + queue.encode(0x5B, (actor, number)) * 2 + queue.encode(0x1E, (actor, 0))
+
+
 def status_use(battle, actor, number, position):
     """-> the queue for a stat-stage status move: one zero group, no hit, the hit record with the
     move's target class, the stat changes."""
@@ -951,6 +985,8 @@ def status_use(battle, actor, number, position):
         raise Unsupported(f"move {number} was never probed")
     if move["name"] in WEATHER_MOVES or move["name"].split()[0] in TERRAINS or move["name"] == "Tailwind":
         return weather_use(battle, actor, number, position, move)
+    if position == 10 and move["target"] == "allAdjacentFoes":
+        return spread_status(battle, actor, number, move)
     own = move["target"] == "self"
     target = actor if own else BATTLER_AT[position]
     if not own and (actor == BOSS) == (target == BOSS):
@@ -1071,6 +1107,8 @@ def inflict(battle, actor, target, name, turns=0):
         return b""
     if battle.b[target].ability in STATUS_GUARDS:
         raise Unsupported(f"battler {target}'s ability {battle.b[target].ability} against a status")
+    if battle.b[target].ability == SYNCHRONIZE and (actor == BOSS) != (target == BOSS) and name != "slp":
+        raise Unsupported("Synchronize")
     if name == "frz" and "sun" in battle.field:
         raise Unsupported("a freeze in the sun")
     if (battle.terrain == "Misty" or battle.terrain == "Electric" and name == "slp") and battle.grounded(target):
@@ -1130,6 +1168,8 @@ def before_move(battle, e):
     st = battle.status.get(actor)
     r = battle.rng
     if actor in battle.flinched:
+        if battle.b[actor].ability == STEADFAST:
+            raise Unsupported("Steadfast flinching")
         return message(actor, 122, actor) + queue.encode(0x52, (actor, 0)), False, "flinch"
     if st and st[0] in (FRZ, SLP):
         if st[0] == FRZ:
@@ -1251,7 +1291,13 @@ WHEN = {
     5: _never,                                                      # Sturdy: use() refuses its knockout
     8: _never, 94: _never,                                          # Sand Veil, Solar Power: weather
     12: _never, 20: _never,                                         # Oblivious, Own Tempo: attraction, confusion
-    28: _never, 30: _never, 61: _never, 62: _never, 63: _never, 93: _never, 95: _never, 131: _never,  # status
+    28: _never, 30: _never,                                         # Synchronize (inflict refuses), Natural Cure
+    62: lambda battle, b, out, inc, every: bool(battle.status.get(b.id)),     # Guts, Marvel Scale, Quick Feet:
+    63: lambda battle, b, out, inc, every: bool(battle.status.get(b.id)),     # statused (damage() and speed()
+    95: lambda battle, b, out, inc, every: bool(battle.status.get(b.id)),     # refuse one statused mid-round)
+    61: lambda battle, b, out, inc, every: not residual_idle(battle, b),      # Shed Skin, Hydration, Healer
+    93: lambda battle, b, out, inc, every: not residual_idle(battle, b),
+    131: lambda battle, b, out, inc, every: not residual_idle(battle, b),
     51: _never,                                                     # Keen Eye: use() refuses evasion stages
     80: _never, 83: _never,                                         # Steadfast, Anger Point: flinch, crit
     104: _never, 163: _never, 164: _never,                          # mold breakers: a target ability refuses
@@ -1570,7 +1616,7 @@ def raid_target(battle, number):
         return 10
     if target in ("self", "adjacentAllyOrSelf"):
         return POSITION[BOSS]
-    if target == "allAdjacentFoes" and move.get("category") != "Status":
+    if target == "allAdjacentFoes":
         return 10                                           # every standing player (spread)
     if target not in ("normal", "any", "randomNormal"):
         raise Unsupported(f"an extra action's move aimed at {target}")
