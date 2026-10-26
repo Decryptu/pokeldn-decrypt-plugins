@@ -736,11 +736,11 @@ def strike(battle, actor, target, number, move, code, i, hits):
     if crit:
         q += queue.encode(0xA7, (tpos, 131)) + queue.encode(0x20, (actor, 26))
     q += queue.encode(0x42, (target, actor, apos, mtype, cat, number, dmg))
+    spit = b""
     if battle.b[target].ability == SAND_SPIT:
-        if (knockout or drops or battle.b[target].item in (AIR_BALLOON, SMOOTH_ROCK) or battle.b[target].ability == RATTLED) \
-                and "sand" not in battle.field:
+        if (knockout or battle.b[target].item in (AIR_BALLOON, SMOOTH_ROCK)) and "sand" not in battle.field:
             raise Unsupported("Sand Spit beside another effect")
-        q += sand_spit(battle, target)
+        spit = sand_spit(battle, target)                    # after the secondaries' commands
     if battle.b[target].item == AIR_BALLOON and not (target == BOSS and knockout):
         if drops:
             raise Unsupported("an Air Balloon popped with a stat drop")
@@ -753,7 +753,7 @@ def strike(battle, actor, target, number, move, code, i, hits):
         battle.stages[target][5] += 1
         q += queue.encode(0x25, (target,)) + queue.encode(0xC7, (target, 0)) + queue.encode(0x0C, (target, 5, 1))
         q += queue.encode(0x92, (target, 5, 1, 0)) + message(target, 15, target) + queue.encode(0xC8, (target,))
-    q += drops + contact
+    q += drops + contact + spit
     if "drain" in move:
         n, d = move["drain"]
         heal = int(dmg * n / d + 0.5)                       # the commands carry it uncapped
