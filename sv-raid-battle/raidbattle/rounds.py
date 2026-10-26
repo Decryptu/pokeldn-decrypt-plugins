@@ -32,7 +32,11 @@ INERT = {"onStart", "onEnd", "onSwitchIn", "onSwitchOut", "onAnySwitchIn", "onDe
 IDLE_ABILITIES = frozenset((0, 3, 29, 33, 34, 44, 53, 77, 81, 84, 137, 141, 232, 246, 304))
 IDLE_ITEMS = frozenset((234, 541))
 # move callbacks that cannot fire in a plain round (Facade: a status the round never sets)
-IDLE_MOVE_CALLBACKS = {"Facade": {"onBasePower"}}
+# moves whose power callback Battle.move_power builds
+IDLE_MOVE_CALLBACKS = {"Facade": {"onBasePower"}, "Venoshock": {"onBasePower"}, "Electro Drift": {"onBasePower"},
+                       "Collision Course": {"onBasePower"}, "Expanding Force": {"onBasePower"},
+                       "Payback": {"basePowerCallback"}, "Hex": {"basePowerCallback"},
+                       "Rising Voltage": {"basePowerCallback"}}
 PRESSURE = 46               # a move aimed at it spends 2 PP: 0x05 (b, 0, 2)
 STURDY = 5
 INNER_FOCUS = 39
@@ -212,6 +216,27 @@ class Battle:
             return 60
         return power
 
+    def move_power(self, actor, target, move):
+        """-> (base power, its onBasePower factor or 0) for a move whose power has its own rule (Showdown
+        moves.ts): Payback doubled when the target moves no more this round, Hex on a statused target,
+        Rising Voltage on a grounded target in Electric Terrain; Facade times 2 under a status other than
+        sleep, Venoshock on a poisoned target, Electro Drift and Collision Course 5461/4096 when super
+        effective, Expanding Force 1.5 in Psychic Terrain from a grounded user."""
+        name, power = move["name"], move["basePower"]
+        st = self.status.get(target, (0,))[0]
+        if name == "Payback" and not any(e.actor == target and not e.done for e in self.entries):
+            power *= 2
+        elif name == "Hex" and st:
+            power *= 2
+        elif name == "Rising Voltage" and self.terrain == "Electric" and self.grounded(target):
+            power *= 2
+        mine = self.status.get(actor, (0,))[0]
+        factor = {"Facade": 2 if mine and mine != SLP else 0, "Venoshock": 2 if st == PSN else 0,
+                  "Electro Drift": 5461 / 4096 if self.effectiveness(move["type"], target) > 1 else 0,
+                  "Collision Course": 5461 / 4096 if self.effectiveness(move["type"], target) > 1 else 0,
+                  "Expanding Force": 1.5 if self.terrain == "Psychic" and self.grounded(actor) else 0}.get(name, 0)
+        return power, factor
+
     def damage(self, actor, target, move, roll, crit):
         a, d = self.b[actor], self.b[target]
         physical = move["category"] == "Physical"
@@ -231,7 +256,7 @@ class Battle:
             att = modify(att, 1.5)                          # Showdown abilities.ts: Hustle, on the stat
         if d.ability == THICK_FAT and move["type"] in ("Fire", "Ice") and a.ability not in MOLD_BREAKERS:
             att = modify(att, 0.5)
-        power = move["basePower"]
+        power, own = self.move_power(actor, target, move)
         boosted = TYPE_BOOSTS.get(str(a.item)) == move["type"]
         ability_boost = {STRONG_JAW: 1.5 if "bite" in move["flags"] else 0,
                          RECKLESS: 4915 / 4096 if "recoil" in move else 0}.get(a.ability, 0)
@@ -250,6 +275,10 @@ class Battle:
             if boosted or ability_boost or a.ability == RIVALRY and a.gender < 2 and d.gender < 2:
                 raise Unsupported("a terrain's power chained with another")
             power = modify(power, terrain)
+        if own:
+            if boosted or ability_boost or terrain or a.ability == RIVALRY and a.gender < 2 and d.gender < 2:
+                raise Unsupported("a move's power chained with another")
+            power = modify(power, own)
         power = self.power(actor, move, power)
         base = (2 * a.level // 5 + 2) * power * att // dfn // 50 + 2
         if move["type"] in ("Fire", "Water") and self.field & {"sun", "rain"}:
@@ -486,7 +515,8 @@ def strike(battle, actor, target, number, move, code, i, hits):
     head = queue.encode(0x7E, (0, *hit))
     head += queue.encode(0x7E, (1, *[int(crit) * h for h in hit]))
     head += queue.encode(0x7E, (2, *e5))
-    record = (apos, tpos, number, mtype, 0, i, 1, int(battle.tera_move(actor, move)), TARGET_CLASS.get(move["target"], 0), 0)
+    doubled = int(move["name"] == "Rising Voltage" and battle.move_power(actor, target, move)[0] != move["basePower"])
+    record = (apos, tpos, number, mtype, doubled, i, 1, int(battle.tera_move(actor, move)), TARGET_CLASS.get(move["target"], 0), 0)
     q = b""
     if crit:
         q += queue.encode(0x37, (actor, 0, 1))
@@ -1641,6 +1671,8 @@ def handler(battle, act, base, last=True):
     actor, number = act[0], act[1]
     if number not in HANDLER_MOVES:
         return b""
+    if base:                                                # the run's key: priority + 7, then the 0x51 value
+        base = (priority(battle, actor, number) + 7) << 16 | battle.paced.get(actor, 1) << 13
     q = queue.encode(0x5A, (actor, number, base + battle.speed(actor, side=False)))    # no Tailwind in it
     return q + queue.encode(0x5B, (actor, number)) if last else q
 
