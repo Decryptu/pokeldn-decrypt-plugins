@@ -1,0 +1,10 @@
+id = "emerald-swap"
+name = "Emerald swap"
+description = "Streams your own Emerald ROM into a running English FireRed over Mystery Gift. Nothing is installed on the console; it lasts until the game is closed."
+version = "1.0.0"
+author = "Decryptu"
+homepage = "https://github.com/Decryptu/pokeldn-decrypt-plugins/tree/main/emerald-swap"
+api = "1.13"
+icon = "icon.png"
+library = "Emerald swap"
+exclude = ["tests", "tools"]

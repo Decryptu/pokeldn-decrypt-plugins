@@ -6,6 +6,7 @@ Plugins for [pokeldn](https://github.com/Decryptu/pokeldn), one folder each, and
 | folder | plugin | what it adds |
 |---|---|---|
 | `sv-raid-battle` | Tera Raid battle server | serves a Scarlet / Violet Tera Raid battle from the host, so the console and the program's Pokemon fight one battle |
+| `emerald-swap` | Emerald swap | streams the player's own Emerald ROM into a running English FireRed over Mystery Gift |
 
 ## Installing
 
@@ -29,5 +30,6 @@ packs the folder signed with `~/.config/pokeldn/decrypt-plugins.pem`, lists it i
 Commit and push `pokeldn-source.json` afterwards: players see the new version once it is on `main`.
 `exclude` in `plugin.toml` keeps tests and tools out of the package.
 
-Every plugin here is written from public sources and pokeldn's own protocol documentation. None carries
-code or data read out of a game.
+Every plugin here is written from public sources and pokeldn's own protocol documentation. No plugin
+carries a game: `emerald-swap` holds a binary patch made from a build of the public decompilation, and
+it needs the player's own ROM to do anything.
