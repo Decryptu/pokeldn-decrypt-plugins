@@ -13,11 +13,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PLUGIN = "emerald-swap"
 EMERALD_SHA1 = "f3ae088181bf583e55daf962a92bb46f4f1d07b7"    # Pokemon Emerald (USA, Europe)
 FIRERED_SHA1 = "baa452d0b24629dd7782cfc07a8984085dde1311"    # FireRed_e.gba in the Switch title
-BUILD = "emerald_switch_bpre.gba"
+BUILD = "emerald_switch_bpre_1_1.gba"                          # named per patch: a cached build outlives an update
+OLD_BUILDS = ("emerald_switch_bpre.gba",)
 PACING = ("--block-repeat", "1", "--inter-block-gap-frames", "8")
-WARNING = ("Emerald lasts until the game is closed. Saving in Emerald replaces the FireRed save on "
-           "the console, and FireRed may then refuse to start from it, with no way to restore your "
-           "backup from the console. Do this only with a save you can lose.")
+NEEDS_APP = (0, 57, 1)                                        # keeps FireRed's copy on a second Emerald save
+WARNING = ("Emerald lasts until the game is closed. Its saves stay on the console beside your FireRed "
+           "save. On the next launch FireRed says the save file is corrupted, then loads its own copy: "
+           "press A. Saving in FireRed replaces the Emerald save, so back up first: part 1 keeps both.")
 
 
 def build_parser():
@@ -55,6 +57,9 @@ def built_rom(path, folder):
     """-> the patched ROM's path in `folder`, built once."""
     import bps
     target = os.path.join(folder, BUILD)
+    for old in OLD_BUILDS:
+        if os.path.exists(os.path.join(folder, old)):
+            os.remove(os.path.join(folder, old))
     if not os.path.exists(target):
         print("Patching your Emerald ROM.", flush=True)
         with open(os.path.join(HERE, "emerald_bpre.bps"), "rb") as handle:
@@ -106,6 +111,12 @@ def agreed(args):
     return answer[0]
 
 
+def check_app():
+    import pokeldn
+    if tuple(int(n) for n in pokeldn.__version__.split(".")[:3]) < NEEDS_APP:
+        sys.exit(f"Update pokeldn to {'.'.join(map(str, NEEDS_APP))} first: this one can write over the FireRed save.")
+
+
 def session(args, *flags):
     from pokeldn.plugins import run_launcher
     return run_launcher("bin/frlg_mg_host.py", ["--live", "--keys", args.keys, "--version", "firered", *flags])
@@ -146,6 +157,7 @@ def main(argv=None):
     if args.step == "save":
         if not args.emerald_save:
             sys.exit("Choose the Emerald save.")
+        check_app()
         return session(args, "--save-restore-emerald", args.emerald_save)
     if not args.emerald:
         sys.exit("Choose your Emerald ROM.")

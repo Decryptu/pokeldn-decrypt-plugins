@@ -10,8 +10,8 @@ from the public decompilation.
 
 | part | what it does |
 |---|---|
-| 1 | backs the FireRed save up into the plugin's library; part 3 refuses to start without one |
-| 2 | optional: writes an Emerald `.sav` beside the console's newest save |
+| 1 | backs the whole save chip up into the plugin's library, FireRed's copy and any Emerald copy; part 3 refuses to start without one |
+| 2 | optional: writes an Emerald `.sav` beside the FireRed save; skip it when Emerald has saved on the console before |
 | 3 | streams Emerald: about 3 h 20 min with an English FireRed file, about 5 h 30 min without |
 
 Parts 2 and 3 run in one launch of the game: the application keeps the save in memory until a game
@@ -22,13 +22,21 @@ black screen, and then the stream starts over in a new launch.
 Only English FireRed has a measured set of the blocks a session runs from, so every other cartridge
 is refused before anything is written.
 
-Saving in Emerald replaces the FireRed save on the console, and FireRed may then not read either copy.
-From a locked game there is no Mystery Gift, so no way to restore the backup from the console. This is
-read from the games' code and unmeasured. Use this with a save you can lose.
+The save chip holds two copies. FireRed's newest copy keeps one slot and Emerald saves only in the
+other, so both games stay on the console. On a later launch FireRed prints that the save file is
+corrupted, then that the previous save will be loaded: its CONTINUE and MYSTERY GIFT entries work and
+part 3 can run again. Emerald offers CONTINUE on its own copy, or NEW GAME with none.
+
+Saving in FireRed writes over Emerald's slot. Run part 1 first: its backup holds both copies and part 2
+takes that file to put Emerald's copy back.
+
+An Emerald streamed by version 1.0.0 saves over FireRed's copy. FireRed then prints "The save file has
+been deleted..." and offers only NEW GAME. The file is unchanged until a new game saves.
 
 Measured on a retail Switch Lite with a XIAO ESP32S3 and the FireRed file: 3645 of 3645 blocks in
 3 h 18 min, then an Emerald save loaded and saved in game. The run without a FireRed file is checked
-under emulation only.
+under emulation only. The save slots are measured on an emulated console with the build of version
+1.1.0; a retail console has run the 1.0.0 build only.
 
 ## Rebuilding the patch
 

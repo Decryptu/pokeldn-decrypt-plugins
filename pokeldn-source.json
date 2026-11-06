@@ -6,13 +6,13 @@
     {
       "id": "emerald-swap",
       "name": "Emerald swap",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "description": "Streams your own Emerald ROM into a running English FireRed over Mystery Gift. Nothing is installed on the console; it lasts until the game is closed.",
       "author": "Decryptu",
       "api": "1.13",
-      "download": "https://github.com/Decryptu/pokeldn-decrypt-plugins/releases/download/emerald-swap-1.0.0/emerald-swap-1.0.0.pokeplugin",
-      "sha256": "7b1aad291a13c487a82e0974b10cff14bb6ae6672233a578f01dc70825d5d4a4",
-      "size": 600879,
+      "download": "https://github.com/Decryptu/pokeldn-decrypt-plugins/releases/download/emerald-swap-1.1.0/emerald-swap-1.1.0.pokeplugin",
+      "sha256": "66d5030c8ac5f8461c7eb28e3dc9704dcc46aa98b87f3bbb9b7bbc22e410295e",
+      "size": 609751,
       "homepage": "https://github.com/Decryptu/pokeldn-decrypt-plugins/tree/main/emerald-swap",
       "icon": "https://raw.githubusercontent.com/Decryptu/pokeldn-decrypt-plugins/main/emerald-swap/icon.png"
     },

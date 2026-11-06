@@ -102,6 +102,30 @@ def test_the_stream_builds_the_rom_once_from_a_zip_and_paces_as_retail_was_measu
     assert argv[-4:] == ["--block-repeat", "1", "--inter-block-gap-frames", "8"]
 
 
+def test_an_update_never_streams_the_old_cached_build(folders, tmp_path, monkeypatch):
+    data, _, _ = folders
+    data.mkdir()
+    (data / swap.OLD_BUILDS[0]).write_bytes(b"old")
+    rom = b"retail" * 64
+    monkeypatch.setattr(swap, "EMERALD_SHA1", hashlib.sha1(rom).hexdigest())
+    (tmp_path / "e.gba").write_bytes(rom)
+    import types
+    monkeypatch.setitem(__import__("sys").modules, "bps", types.SimpleNamespace(apply=lambda s, p: b"new"))
+    assert open(swap.built_rom(str(tmp_path / "e.gba"), str(data)), "rb").read() == b"new"
+    assert not (data / swap.OLD_BUILDS[0]).exists()
+
+
+def test_a_second_emerald_save_needs_an_app_that_keeps_the_firered_copy(folders, tmp_path, monkeypatch):
+    import pokeldn
+    monkeypatch.setattr(pokeldn, "__version__", "0.57.0")
+    with pytest.raises(SystemExit, match="Update pokeldn"):
+        swap.main(["--step", "save", "--emerald-save", str(tmp_path / "e.sav"), "--keys", "K"])
+    assert not folders[2]
+    monkeypatch.setattr(pokeldn, "__version__", "0.57.1")
+    assert swap.main(["--step", "save", "--emerald-save", str(tmp_path / "e.sav"), "--keys", "K"]) == 0
+    assert folders[2]
+
+
 def test_a_rom_with_another_hash_is_refused_by_name(folders, tmp_path):
     (tmp_path / "e.gba").write_bytes(b"hack")
     with pytest.raises(SystemExit, match="USA, Europe"):
