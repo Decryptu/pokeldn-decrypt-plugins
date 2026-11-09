@@ -6,7 +6,7 @@ Plugins for [pokeldn](https://github.com/Decryptu/pokeldn), one folder each, and
 | folder | plugin | what it adds |
 |---|---|---|
 | `sv-raid-battle` | Tera Raid battle server | serves a Scarlet / Violet Tera Raid battle from the host, so the console and the program's Pokemon fight one battle |
-| `emerald-swap` | Emerald swap | streams the player's own Emerald ROM into a running English FireRed over Mystery Gift |
+| `emerald-swap` | Emerald swap | streams the player's own Emerald ROM into a running FireRed or LeafGreen over Mystery Gift |
 
 ## Installing
 

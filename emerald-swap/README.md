@@ -1,10 +1,10 @@
 # Emerald swap
 
-A pokeldn tool under FireRed and LeafGreen that streams Emerald into a running English FireRed on a
-stock console, over Mystery Gift, then soft-resets into it. The FireRed title is untouched: Emerald
+A pokeldn tool under FireRed and LeafGreen that streams Emerald into a running FireRed or LeafGreen
+(English, French, German, Italian or Spanish) on a stock console, over Mystery Gift, then soft-resets into it. The game on the console is untouched: Emerald
 lasts until the game is closed.
 
-The plugin carries no game. `emerald_bpre.bps` turns the player's own Pokemon Emerald (USA, Europe),
+The plugin carries no game. `emerald_<code>.bps`, one per cartridge, turns the player's own Pokemon Emerald (USA, Europe),
 SHA-1 `f3ae088181bf583e55daf962a92bb46f4f1d07b7`, into the Switch build pokeldn's `tools/rse` compiles
 from the public decompilation.
 
@@ -12,15 +12,16 @@ from the public decompilation.
 |---|---|
 | 1 | backs the whole save chip up into the plugin's library, FireRed's copy and any Emerald copy; part 3 refuses to start without one |
 | 2 | optional: writes an Emerald `.sav` beside the FireRed save; skip it when Emerald has saved on the console before |
-| 3 | streams Emerald: about 3 h 20 min with an English FireRed file, about 5 h 30 min without |
+| 3 | streams Emerald: about 3 h 20 min with the game file, about 5 h 30 min without |
 
 Parts 2 and 3 run in one launch of the game: the application keeps the save in memory until a game
 saves. Turn the console's auto-sleep off before part 3. A stream cut by sleep went back to the title
 screen and went on from where it stopped in the next run; after a link error the game can stay on a
 black screen, and then the stream starts over in a new launch.
 
-Only English FireRed has a measured set of the blocks a session runs from, so every other cartridge
-is refused before anything is written.
+Only English FireRed has a measured set of the blocks a session runs from. The other nine Latin
+cartridges carry it by code matching (pokeldn's `tools/rse/live_blocks.py`, pokeldn 0.62.0 or later),
+checked offline under unicorn; the Japanese cartridges are refused.
 
 The save chip holds two copies. FireRed's newest copy keeps one slot and Emerald saves only in the
 other, so both games stay on the console. On a later launch FireRed prints that the save file is
@@ -41,6 +42,6 @@ under emulation only. The save slots are measured on an emulated console with th
 ## Rebuilding the patch
 
     cd ../../pokeldn
-    ./.venv/bin/python tools/rse/emerald_switch_build.py --tree ~/pokeemerald_switch --cart BPRE --cpp /opt/homebrew/bin/cpp-16
+    ./.venv/bin/python tools/rse/emerald_switch_build.py --tree ~/pokeemerald_switch --cart CODE --cpp /opt/homebrew/bin/cpp-16
     cd -
-    python tools/make_patch.py RETAIL.gba ~/pokeemerald_switch/pokeemerald_switch_BPRE.gba emerald_bpre.bps
+    python tools/make_patch.py RETAIL.gba ~/pokeemerald_switch/pokeemerald_switch_CODE.gba emerald_code.bps

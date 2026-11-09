@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """The Emerald swap tool: a backup, an optional Emerald save, then the stream, each through
-bin/frlg_mg_host.py. Emerald comes from the player's ROM and emerald_bpre.bps."""
+bin/frlg_mg_host.py. Emerald comes from the player's ROM and the patch for the console's cartridge."""
 import argparse
 import hashlib
 import os
@@ -12,9 +12,21 @@ import zipfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 PLUGIN = "emerald-swap"
 EMERALD_SHA1 = "f3ae088181bf583e55daf962a92bb46f4f1d07b7"    # Pokemon Emerald (USA, Europe)
-FIRERED_SHA1 = "baa452d0b24629dd7782cfc07a8984085dde1311"    # FireRed_e.gba in the Switch title
-BUILD = "emerald_switch_bpre_1_1.gba"                          # named per patch: a cached build outlives an update
-OLD_BUILDS = ("emerald_switch_bpre.gba",)
+# The cartridge each Switch title carries, by game code; the patch builds Emerald for that cartridge.
+CARTRIDGES = {
+    "BPRE": ("English FireRed", "baa452d0b24629dd7782cfc07a8984085dde1311"),
+    "BPGE": ("English LeafGreen", "62b9fc77549dbc67032eb6cbd0ea6ad3b825690f"),
+    "BPRF": ("French FireRed", "07566b82dbd2a91321698f730f6400ae4c56ddf1"),
+    "BPGF": ("French LeafGreen", "9f774956dfbad7f69ddb91fb91d2c26e54408f75"),
+    "BPRD": ("German FireRed", "8dd70575fae5a089598832a153723497fcabc9bc"),
+    "BPGD": ("German LeafGreen", "3c229e8d0daa43a7a3d1822323d4b2f2cd70390a"),
+    "BPRI": ("Italian FireRed", "923a9f8ce93e66c756cff4a325d2248a7b2f53eb"),
+    "BPGI": ("Italian LeafGreen", "24a4b7084658a7aa51100d92f7540d376a27ac75"),
+    "BPRS": ("Spanish FireRed", "faf64fc6cdf417fee2f1005103a5a64bd2033918"),
+    "BPGS": ("Spanish LeafGreen", "0d2a0026898375895dfd7ea139ceae90324add8f"),
+}
+OLD_BUILDS = ("emerald_switch_bpre.gba", "emerald_switch_bpre_1_1.gba")
+NEEDS_APP_CART = (0, 62, 0)                                   # the live blocks of every cartridge but BPRE
 PACING = ("--block-repeat", "1", "--inter-block-gap-frames", "8")
 NEEDS_APP = (0, 57, 1)                                        # keeps FireRed's copy on a second Emerald save
 WARNING = ("Emerald lasts until the game is closed. Its saves stay on the console beside your FireRed "
@@ -29,6 +41,7 @@ def build_parser():
     parser.add_argument("--emerald-save", default="")
     parser.add_argument("--emerald", default="")
     parser.add_argument("--firered", default="")
+    parser.add_argument("--cartridge", choices=tuple(CARTRIDGES), default="BPRE")
     parser.add_argument("--agree", action="store_true", help="agree to the warning with no pop-up")
     return parser
 
@@ -53,16 +66,20 @@ def emerald_rom(path):
     return rom
 
 
-def built_rom(path, folder):
+def build_name(code):
+    return f"emerald_switch_{code.lower()}_1_2.gba"            # named per patch: a cached build outlives an update
+
+
+def built_rom(path, folder, code="BPRE"):
     """-> the patched ROM's path in `folder`, built once."""
     import bps
-    target = os.path.join(folder, BUILD)
+    target = os.path.join(folder, build_name(code))
     for old in OLD_BUILDS:
         if os.path.exists(os.path.join(folder, old)):
             os.remove(os.path.join(folder, old))
     if not os.path.exists(target):
         print("Patching your Emerald ROM.", flush=True)
-        with open(os.path.join(HERE, "emerald_bpre.bps"), "rb") as handle:
+        with open(os.path.join(HERE, f"emerald_{code.lower()}.bps"), "rb") as handle:
             rom = bps.apply(emerald_rom(path), handle.read())
         with open(target + ".part", "wb") as handle:
             handle.write(rom)
@@ -72,20 +89,23 @@ def built_rom(path, folder):
     return target
 
 
-def firered_base(path, keys, folder):
+def firered_base(path, keys, folder, code="BPRE"):
     """-> the path of the console's cartridge, or "none": the stream then goes with no help from it."""
     if not path:
-        print("No FireRed file: the stream takes about 5 h 30 min.", flush=True)
+        print("No game file: the stream takes about 5 h 30 min.", flush=True)
         return "none"
     from pokeldn.switch import cartridge
     try:
         rom = cartridge.read(path, keys)
     except (OSError, ValueError, KeyError, StopIteration) as exc:
         sys.exit(f"Could not read {os.path.basename(path)}: {exc}")
-    if hashlib.sha1(rom).hexdigest() != FIRERED_SHA1:
-        sys.exit("That is not English FireRed from the Switch title, the only game this swap has "
-                 "been measured on. Leave the FireRed file empty to go without it.")
-    target = os.path.join(folder, "firered_e.gba")
+    name, sha1 = CARTRIDGES[code]
+    if hashlib.sha1(rom).hexdigest() != sha1:
+        found = rom[0xAC:0xB0].decode("ascii", "replace")
+        sys.exit(f"That file is not {name} from the Switch title"
+                 + (f" (it holds {CARTRIDGES[found][0]}: pick that game)" if found in CARTRIDGES else "")
+                 + ". Leave the file empty to go without it.")
+    target = os.path.join(folder, f"{code.lower()}.gba")
     with open(target, "wb") as handle:
         handle.write(rom)
     return target
@@ -111,10 +131,10 @@ def agreed(args):
     return answer[0]
 
 
-def check_app():
+def check_app(needs=NEEDS_APP, why="this one can write over the FireRed save"):
     import pokeldn
-    if tuple(int(n) for n in pokeldn.__version__.split(".")[:3]) < NEEDS_APP:
-        sys.exit(f"Update pokeldn to {'.'.join(map(str, NEEDS_APP))} first: this one can write over the FireRed save.")
+    if tuple(int(n) for n in pokeldn.__version__.split(".")[:3]) < needs:
+        sys.exit(f"Update pokeldn to {'.'.join(map(str, needs))} first: {why}.")
 
 
 def session(args, *flags):
@@ -133,8 +153,10 @@ def backup(args, library, folder):
 def stream(args, library, folder):
     if not any(name.endswith(".sav") for name in os.listdir(library)):
         sys.exit("Back up the FireRed save first: choose part 1.")
-    rom = built_rom(args.emerald, folder)
-    base = firered_base(args.firered, args.keys, folder)
+    if args.cartridge != "BPRE":
+        check_app(NEEDS_APP_CART, "this one streams only into English FireRed")
+    rom = built_rom(args.emerald, folder, args.cartridge)
+    base = firered_base(args.firered, args.keys, folder, args.cartridge)
     if not agreed(args):
         return 0
     status = session(args, "--rom-transfer", rom, "--rom-base", base, *PACING)

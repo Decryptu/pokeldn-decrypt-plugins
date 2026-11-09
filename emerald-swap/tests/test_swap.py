@@ -43,8 +43,9 @@ def test_another_rom_or_a_damaged_patch_is_refused():
         bps.apply(source, patch[:20] + b"\0" + patch[21:])
 
 
-def test_the_shipped_patch_expects_retail_emerald_and_makes_the_16_mb_build():
-    with open(os.path.join(HERE, "emerald_bpre.bps"), "rb") as handle:
+@pytest.mark.parametrize("code", sorted(swap.CARTRIDGES))
+def test_the_shipped_patch_expects_retail_emerald_and_makes_the_16_mb_build(code):
+    with open(os.path.join(HERE, f"emerald_{code.lower()}.bps"), "rb") as handle:
         patch = handle.read()
     source_size, at = bps._varint(patch, 4)
     target_size, at = bps._varint(patch, at)
@@ -97,8 +98,8 @@ def test_the_stream_builds_the_rom_once_from_a_zip_and_paces_as_retail_was_measu
     assert built == [rom]
     argv = calls[0][1]
     assert argv[argv.index("--rom-base") + 1] == "none"
-    assert argv[argv.index("--rom-transfer") + 1] == str(data / swap.BUILD)
-    assert (data / swap.BUILD).read_bytes() == b"built"
+    assert argv[argv.index("--rom-transfer") + 1] == str(data / swap.build_name("BPRE"))
+    assert (data / swap.build_name("BPRE")).read_bytes() == b"built"
     assert argv[-4:] == ["--block-repeat", "1", "--inter-block-gap-frames", "8"]
 
 
@@ -132,7 +133,18 @@ def test_a_rom_with_another_hash_is_refused_by_name(folders, tmp_path):
         swap.emerald_rom(str(tmp_path / "e.gba"))
 
 
-def test_another_cartridge_is_refused_before_a_session(folders, tmp_path):
-    (tmp_path / "f.gba").write_bytes(b"leafgreen")
-    with pytest.raises(SystemExit, match="English FireRed"):
+def test_another_cartridge_is_refused_before_a_session_and_named(folders, tmp_path):
+    (tmp_path / "f.gba").write_bytes(bytes(0xAC) + b"BPRF" + bytes(16))
+    with pytest.raises(SystemExit, match="not English FireRed.*holds French FireRed"):
         swap.firered_base(str(tmp_path / "f.gba"), "", str(tmp_path))
+
+
+def test_a_cartridge_past_english_firered_needs_an_app_with_its_live_blocks(folders, tmp_path, monkeypatch):
+    import pokeldn
+    data, library, calls = folders
+    library.mkdir()
+    (library / "FireRed.sav").write_bytes(b"\0")
+    monkeypatch.setattr(pokeldn, "__version__", "0.61.0")
+    with pytest.raises(SystemExit, match="Update pokeldn to 0.62.0"):
+        swap.main(["--step", "stream", "--emerald", str(tmp_path / "e.gba"), "--cartridge", "BPRF", "--agree"])
+    assert not calls

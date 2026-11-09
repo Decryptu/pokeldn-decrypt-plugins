@@ -1,4 +1,4 @@
-"""pokeldn plugin: Emerald in place of a running English FireRed, built from the player's own ROM."""
+"""pokeldn plugin: Emerald in place of a running FireRed or LeafGreen, built from the player's own ROM."""
 from pokeldn.plugins import Field, Tool
 
 MENU = "Title screen: Mystery Gift, Wonder Cards, Friend. Wait on the search screen."
@@ -8,7 +8,7 @@ JOIN = "Press Start here, then pick POKELDN when it appears."
 def register(api):
     api.add_tool("frlg", Tool(
         "emerald-swap", "Emerald swap", "swap.py",
-        "Stream your own Emerald ROM into a running English FireRed, then play it. Every console is stock; "
+        "Stream your own Emerald ROM into a running FireRed or LeafGreen, then play it. Every console is stock; "
         "it lasts until the game is closed.",
         (("Back up first: nothing else starts until a backup exists.", ("--step", "backup")),
          (MENU, ("--step", "backup")), (JOIN, ("--step", "backup")),
@@ -19,7 +19,7 @@ def register(api):
           "stream. Back on the title screen, run this part again: it goes on from where it stopped. A "
           "black screen means closing the game and starting again from part 2.", ("--step", "stream")),
          (MENU, ("--step", "stream")), (JOIN, ("--step", "stream")),
-         ("Leave it. With your FireRed file it takes about 3 h 20 min, without about 5 h 30 min. "
+         ("Leave it. With your game file it takes about 3 h 20 min, without about 5 h 30 min. "
           "Emerald starts on its own.", ("--step", "stream")),
          ("In a later launch FireRed says the save file is corrupted, then loads its own copy: press A. "
           "Do not save in FireRed unless part 1 has run: that save replaces Emerald's.", ("--step", "stream"))),
@@ -34,7 +34,14 @@ def register(api):
             Field("--emerald", "Your Emerald ROM", "file", exts=("gba", "zip"), when=("--step", "stream"),
                   required=True, help="Pokemon Emerald, USA/Europe, as a .gba or a .zip holding one. "
                                       "The plugin carries a patch and no game."),
-            Field("--firered", "Your FireRed (optional)", "file", exts=("gba", "nsp", "xci"),
+            Field("--cartridge", "Your game", "choice", default="BPRE", when=("--step", "stream"),
+                  choices=(("BPRE", "English FireRed"), ("BPGE", "English LeafGreen"),
+                           ("BPRF", "French FireRed"), ("BPGF", "French LeafGreen"),
+                           ("BPRD", "German FireRed"), ("BPGD", "German LeafGreen"),
+                           ("BPRI", "Italian FireRed"), ("BPGI", "Italian LeafGreen"),
+                           ("BPRS", "Spanish FireRed"), ("BPGS", "Spanish LeafGreen")),
+                  help="The game the console runs. Japanese is not supported."),
+            Field("--firered", "Your game file (optional)", "file", exts=("gba", "nsp", "xci"),
                   when=("--step", "stream"),
-                  help="English FireRed as a .gba or the game's package. It cuts the stream by 40%."),
+                  help="The same game as a .gba or the game's package. It cuts the stream by 40%."),
         )))
