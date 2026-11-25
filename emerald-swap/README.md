@@ -39,6 +39,19 @@ Measured on a retail Switch Lite with a XIAO ESP32S3 and the FireRed file: 3645 
 under emulation only. The save slots are measured on an emulated console with the build of version
 1.1.0; a retail console has run the 1.0.0 build only.
 
+## Wireless after streaming (`gSTWIStatus` alignment)
+
+At launch, the Switch wrapper caches the host FireRed/LeafGreen cartridge's `&gSTWIStatus` IWRAM
+address (`0x030030E0` on `BPRE`/`BPGE`, `0x03003030` on European builds) for `IntrSIO32`'s
+`bkpt #0x52` hook. Because `emerald-swap` streams Emerald without relaunching the application,
+`swap.py` aligns Emerald's `&gSTWIStatus` (normally `0x03007988`) to the host cartridge's address
+(relocating `gCurGlyph` from `0x030030B0..0x03003133` to free IWRAM `0x03007A00..0x03007A83` on
+English cartridges).
+
+Measured on a retail stock Switch running English LeafGreen (`BPGE`): after streaming the aligned
+Emerald build, Emerald's **Mystery Gift -> Wonder Cards -> Friend** completed a full LDN session
+against pokeldn and installed a Gen 3 Mystery Gift payload cleanly (39 s).
+
 ## Rebuilding the patch
 
     cd ../../pokeldn
