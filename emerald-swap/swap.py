@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import os
 import queue
+import struct
 import sys
 import time
 import zipfile
@@ -25,7 +26,31 @@ CARTRIDGES = {
     "BPRS": ("Spanish FireRed", "faf64fc6cdf417fee2f1005103a5a64bd2033918"),
     "BPGS": ("Spanish LeafGreen", "0d2a0026898375895dfd7ea139ceae90324add8f"),
 }
-OLD_BUILDS = ("emerald_switch_bpre.gba", "emerald_switch_bpre_1_1.gba")
+OLD_BUILDS = (
+    "emerald_switch_bpre.gba",
+    "emerald_switch_bpre_1_1.gba",
+    *(f"emerald_switch_{code.lower()}_1_2.gba" for code in CARTRIDGES),
+)
+# Host cartridge &gSTWIStatus cached by the Switch wrapper at launch (holder+0x170):
+# English FireRed/LeafGreen place it at 0x030030E0; the eight European builds at 0x03003030
+# (gMain + 0xD60). Streamed Emerald must keep &gSTWIStatus at the host cartridge's address so
+# IntrSIO32's bkpt #0x52 hook reads the live pointer during wireless sessions.
+HOST_STWI_STATUS = {
+    "BPRE": 0x030030E0, "BPGE": 0x030030E0,
+    "BPRF": 0x03003030, "BPGF": 0x03003030,
+    "BPRD": 0x03003030, "BPGD": 0x03003030,
+    "BPRI": 0x03003030, "BPGI": 0x03003030,
+    "BPRS": 0x03003030, "BPGS": 0x03003030,
+}
+EMERALD_STWI_STATUS = 0x03007988
+EMERALD_STWI_REFS = 69
+# On English cartridges 0x030030E0 falls inside Emerald's gCurGlyph (0x030030B0..0x03003133);
+# relocate the full 0x84-byte struct to free IWRAM at 0x03007A00..0x03007A83.
+EMERALD_GLYPH_BASE = 0x030030B0
+EMERALD_GLYPH_SIZE = 0x84
+EMERALD_GLYPH_NEW = 0x03007A00
+EMERALD_GLYPH_REFS = {0x030030B0: 25, 0x030030D0: 2, 0x030030F0: 2, 0x03003110: 1}
+EMERALD_CODE_END = 0x00300000
 NEEDS_APP_CART = (0, 62, 0)                                   # the live blocks of every cartridge but BPRE
 PACING = ("--block-repeat", "1", "--inter-block-gap-frames", "8")
 NEEDS_APP = (0, 57, 1)                                        # keeps FireRed's copy on a second Emerald save
@@ -66,8 +91,66 @@ def emerald_rom(path):
     return rom
 
 
+def _is_ldr_literal(rom, off):
+    """True iff an ARM or Thumb PC-relative LDR before `off` loads the 32-bit word at `off`."""
+    for pc in range(max(0, off - 1024), off, 2):
+        h = struct.unpack_from("<H", rom, pc)[0]
+        if (h & 0xF800) == 0x4800 and (((pc + 4) & ~3) + ((h & 0xFF) << 2)) == off:
+            return True
+    for pc in range(max(0, off - 4096), off, 4):
+        w = struct.unpack_from("<I", rom, pc)[0]
+        if (w & 0x0F7F0000) == 0x051F0000:
+            imm = w & 0xFFF
+            if pc + 8 + (imm if (w >> 23) & 1 else -imm) == off:
+                return True
+    return False
+
+
+def align_stwi_status(rom, code):
+    """Move Emerald's &gSTWIStatus to the host cartridge's cached IWRAM address so wireless
+    (Mystery Gift, trade, Union Room) works after streaming without relaunching the app."""
+    if len(rom) != 0x1000000 or rom[0xAC:0xB0] != b"BPEE" or rom[0xBC] != 0x0A:
+        raise ValueError("expected a 16 MB Switch Emerald build (BPEE rev 0x0A)")
+    target = HOST_STWI_STATUS[code]
+    out = bytearray(rom)
+
+    if EMERALD_GLYPH_BASE <= target < EMERALD_GLYPH_BASE + EMERALD_GLYPH_SIZE:
+        for off in range(0, EMERALD_CODE_END, 4):
+            w = struct.unpack_from("<I", rom, off)[0]
+            if EMERALD_GLYPH_NEW <= w < EMERALD_GLYPH_NEW + EMERALD_GLYPH_SIZE and _is_ldr_literal(rom, off):
+                raise ValueError(f"relocation target 0x{w:08X} is already referenced")
+        glyph_refs = {addr: [] for addr in EMERALD_GLYPH_REFS}
+        for off in range(0, EMERALD_CODE_END, 4):
+            w = struct.unpack_from("<I", rom, off)[0]
+            if EMERALD_GLYPH_BASE <= w < EMERALD_GLYPH_BASE + EMERALD_GLYPH_SIZE:
+                if w not in glyph_refs or not _is_ldr_literal(rom, off):
+                    raise ValueError(f"unexpected gCurGlyph reference 0x{w:08X} at 0x{off:06X}")
+                glyph_refs[w].append(off)
+        for addr, expected in EMERALD_GLYPH_REFS.items():
+            if len(glyph_refs[addr]) != expected:
+                raise ValueError(f"expected {expected} refs to 0x{addr:08X}, got {len(glyph_refs[addr])}")
+        delta = EMERALD_GLYPH_NEW - EMERALD_GLYPH_BASE
+        for addr, offsets in glyph_refs.items():
+            packed = struct.pack("<I", addr + delta)
+            for off in offsets:
+                out[off:off + 4] = packed
+
+    stwi_refs = []
+    for off in range(0, EMERALD_CODE_END, 4):
+        if struct.unpack_from("<I", rom, off)[0] == EMERALD_STWI_STATUS:
+            if not _is_ldr_literal(rom, off):
+                raise ValueError(f"non-LDR gSTWIStatus word at 0x{off:06X}")
+            stwi_refs.append(off)
+    if len(stwi_refs) != EMERALD_STWI_REFS:
+        raise ValueError(f"expected {EMERALD_STWI_REFS} refs to 0x{EMERALD_STWI_STATUS:08X}, got {len(stwi_refs)}")
+    packed = struct.pack("<I", target)
+    for off in stwi_refs:
+        out[off:off + 4] = packed
+    return bytes(out)
+
+
 def build_name(code):
-    return f"emerald_switch_{code.lower()}_1_2.gba"            # named per patch: a cached build outlives an update
+    return f"emerald_switch_{code.lower()}_1_3.gba"            # named per patch: a cached build outlives an update
 
 
 def built_rom(path, folder, code="BPRE"):
@@ -80,7 +163,7 @@ def built_rom(path, folder, code="BPRE"):
     if not os.path.exists(target):
         print("Patching your Emerald ROM.", flush=True)
         with open(os.path.join(HERE, f"emerald_{code.lower()}.bps"), "rb") as handle:
-            rom = bps.apply(emerald_rom(path), handle.read())
+            rom = align_stwi_status(bps.apply(emerald_rom(path), handle.read()), code)
         with open(target + ".part", "wb") as handle:
             handle.write(rom)
         os.replace(target + ".part", target)

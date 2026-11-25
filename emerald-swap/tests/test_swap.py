@@ -91,6 +91,7 @@ def test_the_stream_builds_the_rom_once_from_a_zip_and_paces_as_retail_was_measu
     import types
     monkeypatch.setitem(__import__("sys").modules, "bps", types.SimpleNamespace(
         apply=lambda source, patch: built.append(source) or b"built"))
+    monkeypatch.setattr(swap, "align_stwi_status", lambda rom, code: rom)
     import pokeldn.panel
     monkeypatch.setattr(pokeldn.panel, "show", lambda *a, **k: None)
     for _ in range(2):
@@ -112,6 +113,7 @@ def test_an_update_never_streams_the_old_cached_build(folders, tmp_path, monkeyp
     (tmp_path / "e.gba").write_bytes(rom)
     import types
     monkeypatch.setitem(__import__("sys").modules, "bps", types.SimpleNamespace(apply=lambda s, p: b"new"))
+    monkeypatch.setattr(swap, "align_stwi_status", lambda rom, code: rom)
     assert open(swap.built_rom(str(tmp_path / "e.gba"), str(data)), "rb").read() == b"new"
     assert not (data / swap.OLD_BUILDS[0]).exists()
 
@@ -148,3 +150,67 @@ def test_a_cartridge_past_english_firered_needs_an_app_with_its_live_blocks(fold
     with pytest.raises(SystemExit, match="Update pokeldn to 0.62.0"):
         swap.main(["--step", "stream", "--emerald", str(tmp_path / "e.gba"), "--cartridge", "BPRF", "--agree"])
     assert not calls
+
+
+def _synthetic_emerald_switch_rom():
+    """Minimal 16 MB BPEE rev 0x0A image with exact Thumb/ARM PC-relative LDR pools for
+    gCurGlyph (30 refs) and &gSTWIStatus (69 refs), plus a graphics coincidence past CODE_END."""
+    import struct
+    rom = bytearray(0x1000000)
+    rom[0xAC:0xB0] = b"BPEE"
+    rom[0xBC] = 0x0A
+    cur = 0x1000
+    glyph_sites = []
+    for addr, count in swap.EMERALD_GLYPH_REFS.items():
+        for _ in range(count):
+            # Thumb: ldr r0, [pc, #0] (0x4800) at cur, literal at cur + 4
+            struct.pack_into("<HHI", rom, cur, 0x4800, 0x46C0, addr)
+            glyph_sites.append((cur + 4, addr))
+            cur += 8
+    stwi_sites = []
+    for i in range(swap.EMERALD_STWI_REFS):
+        if i % 2 == 0:
+            struct.pack_into("<HHI", rom, cur, 0x4800, 0x46C0, swap.EMERALD_STWI_STATUS)
+            stwi_sites.append(cur + 4)
+            cur += 8
+        else:
+            # ARM: ldr r3, [pc, #0] (0xE59F3000) at cur, literal at cur + 8
+            struct.pack_into("<III", rom, cur, 0xE59F3000, 0xE1A00000, swap.EMERALD_STWI_STATUS)
+            stwi_sites.append(cur + 8)
+            cur += 12
+    # Coincidental bytes in graphics region past EMERALD_CODE_END must stay untouched
+    coincidence = swap.EMERALD_CODE_END + 0x100
+    struct.pack_into("<I", rom, coincidence, swap.EMERALD_STWI_STATUS)
+    return bytes(rom), glyph_sites, stwi_sites, coincidence
+
+
+def test_align_stwi_status_english_relocates_glyph_and_stwi():
+    import struct
+    rom, glyph_sites, stwi_sites, coincidence = _synthetic_emerald_switch_rom()
+    patched = swap.align_stwi_status(rom, "BPGE")
+    delta = swap.EMERALD_GLYPH_NEW - swap.EMERALD_GLYPH_BASE
+    for off, old in glyph_sites:
+        assert struct.unpack_from("<I", patched, off)[0] == old + delta
+    for off in stwi_sites:
+        assert struct.unpack_from("<I", patched, off)[0] == 0x030030E0
+    assert struct.unpack_from("<I", patched, coincidence)[0] == swap.EMERALD_STWI_STATUS
+
+
+def test_align_stwi_status_european_redirects_stwi_without_moving_glyph():
+    import struct
+    rom, glyph_sites, stwi_sites, coincidence = _synthetic_emerald_switch_rom()
+    patched = swap.align_stwi_status(rom, "BPRF")
+    for off, old in glyph_sites:
+        assert struct.unpack_from("<I", patched, off)[0] == old
+    for off in stwi_sites:
+        assert struct.unpack_from("<I", patched, off)[0] == 0x03003030
+    assert struct.unpack_from("<I", patched, coincidence)[0] == swap.EMERALD_STWI_STATUS
+
+
+def test_align_stwi_status_refuses_unexpected_count_or_non_ldr_word():
+    import struct
+    rom, _, stwi_sites, _ = _synthetic_emerald_switch_rom()
+    bad = bytearray(rom)
+    struct.pack_into("<I", bad, stwi_sites[0], 0)
+    with pytest.raises(ValueError, match="expected 69 refs"):
+        swap.align_stwi_status(bytes(bad), "BPGE")
